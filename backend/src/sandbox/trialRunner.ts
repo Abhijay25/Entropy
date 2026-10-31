@@ -1,4 +1,4 @@
-import { TrialTelemetrySchema, type CleanupStatus, type Fault, type TrialKind, type TrialTelemetry } from '../../../shared/types.js';
+import { TrialTelemetrySchema, type ArtifactRef, type CleanupStatus, type Fault, type TrialKind, type TrialTelemetry } from '../../../shared/types.js';
 import { collectTrialArtifacts } from '../evidence/collect.js';
 import type { LoadedPayload } from './payloadManifest.js';
 import { ProviderTimeoutError, SANDBOX_OWNER, type SandboxLabels, type SandboxProvider } from './provider.js';
@@ -94,7 +94,7 @@ export class TrialRunner {
     if (exitCode !== 0) {
       return { dispatchedAt, returnedAt, trial: emptyTrial(spec, this.payload, this.executionMode, { ...base, status: 'FAILED', error: { code: 'HARNESS_FAILED', message: `runTrial exited ${exitCode}: ${output.trim().slice(-400) || 'no output'}` }, warnings: collected.errors.slice(0, 32) }) };
     }
-    return { dispatchedAt, returnedAt, trial: this.validateReport(prepared, collected.contents.metrics, collected.contents.runtime, base, collected.errors) };
+    return { dispatchedAt, returnedAt, trial: this.validateReport(prepared, collected.contents, base, collected.errors) };
   }
 
   /** Deletes with one retry. Returns the cleanup status; never throws. */
@@ -135,8 +135,10 @@ export class TrialRunner {
     throw new TrialFailure('SANDBOX_CREATE_TIMEOUT', 'Sandbox creation timed out twice.');
   }
 
-  private validateReport(prepared: PreparedTrial, reportBytes: Buffer | undefined, runtimeBytes: Buffer | undefined, base: Pick<TrialTelemetry, 'sandboxId' | 'cleanupStatus' | 'artifacts' | 'startedAt' | 'finishedAt'>, collectionErrors: string[]): TrialTelemetry {
+  private validateReport(prepared: PreparedTrial, contents: Partial<Record<ArtifactRef['kind'], Buffer>>, base: Pick<TrialTelemetry, 'sandboxId' | 'cleanupStatus' | 'artifacts' | 'startedAt' | 'finishedAt'>, collectionErrors: string[]): TrialTelemetry {
     const { spec } = prepared;
+    const reportBytes = contents.metrics;
+    const runtimeBytes = contents.runtime;
     const fail = (code: string, message: string) => emptyTrial(spec, this.payload, this.executionMode, { ...base, status: 'FAILED', error: { code, message: message.slice(0, 512) }, warnings: collectionErrors.slice(0, 32) });
     if (!reportBytes || !runtimeBytes) return fail('REPORT_MISSING', 'trial.json or runtime.json was not collected.');
     let raw: Record<string, unknown>;
@@ -166,6 +168,34 @@ export class TrialRunner {
       warnings: [...((report.warnings as string[] | undefined) ?? []), ...collectionErrors].slice(0, 32)
     });
     if (!parsed.success) return fail('REPORT_INVALID', `trial.json failed validation: ${parsed.error.issues.slice(0, 3).map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; ')}`);
+    const evidenceProblem = crossCheckEvidence(parsed.data, contents.spans, contents.fault_witness, spec.fault !== null);
+    if (evidenceProblem) return fail('REPORT_EVIDENCE_MISMATCH', evidenceProblem);
     return parsed.data;
   }
+}
+
+/**
+ * Verifies the report against the raw files actually collected, rather than trusting trial.json's own
+ * claims: spans.jsonl must be the same retained spans, and the controller's witness record must name
+ * exactly the delayed Redis business spans and the fault mode this trial requested.
+ */
+export function crossCheckEvidence(report: TrialTelemetry, spansBytes: Buffer | undefined, witnessBytes: Buffer | undefined, faultRequested: boolean): string | undefined {
+  if (!spansBytes || !witnessBytes) return 'Raw spans or fault-witness evidence was not collected.';
+  let rawIds: string[];
+  let witness: { fault?: { mode?: unknown }; businessWitnessSpanIds?: unknown };
+  try {
+    rawIds = spansBytes.toString('utf8').split('\n').filter((line) => line.trim()).map((line) => String((JSON.parse(line) as { id?: unknown }).id));
+    witness = JSON.parse(witnessBytes.toString('utf8')) as typeof witness;
+  } catch {
+    return 'Raw spans or fault-witness evidence is not valid JSON.';
+  }
+  if (rawIds.length !== report.spans.length || rawIds.some((id, index) => id !== report.spans[index]!.id)) return 'spans.jsonl does not match the spans in trial.json.';
+  const expectedMode = faultRequested ? 'redis_latency' : 'healthy';
+  if (witness.fault?.mode !== expectedMode) return `Controller fault mode ${String(witness.fault?.mode)} does not match the requested ${expectedMode}.`;
+  if (!Array.isArray(witness.businessWitnessSpanIds)) return 'fault-witness.json has no businessWitnessSpanIds list.';
+  const recorded = new Set(witness.businessWitnessSpanIds.map(String));
+  const delayed = new Set(report.spans.filter((span) => span.kind === 'server' && span.serviceId === 'redis-cache' && span.channel === 'business' && span.faultApplied).map((span) => span.id));
+  if (recorded.size !== delayed.size || [...delayed].some((id) => !recorded.has(id))) return 'Controller witness record disagrees with the delayed Redis business spans in the report.';
+  if (report.faultWitnessed !== (delayed.size > 0)) return 'faultWitnessed disagrees with the recorded witnesses.';
+  return undefined;
 }

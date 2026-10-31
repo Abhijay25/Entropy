@@ -127,6 +127,8 @@ export function persistedComparison(run: RunSnapshot): ComparisonResult {
 
 export class Orchestrator implements OrchestratorContract {
   private active?: ActiveWorkflow;
+  /** Held from the first line of an accepted action until its workflow starts (or admission fails). */
+  private admission?: { key: string; result: Promise<unknown> };
   private persistenceHalted?: string;
   private readonly allocations = new Map<string, number>();
   private readonly createId: () => string;
@@ -150,7 +152,36 @@ export class Orchestrator implements OrchestratorContract {
 
   // ---------------------------------------------------------------- public actions
 
-  async startRun(operationKey: string): Promise<{ runId: EntityId }> {
+  startRun(operationKey: string): Promise<{ runId: EntityId }> {
+    return this.admit(`run:${operationKey}`, () => this.admitRun(operationKey));
+  }
+
+  reproduce(runId: EntityId, operationKey: string): Promise<{ reproductionId: EntityId; trialIds: EntityId[] }> {
+    return this.admit(`reproduce:${operationKey}`, () => this.admitReproduction(runId, operationKey));
+  }
+
+  investigate(runId: EntityId, operationKey: string): Promise<{ diagnosticId: EntityId }> {
+    return this.admit(`investigate:${operationKey}`, () => this.admitDiagnostic(runId, operationKey));
+  }
+
+  /**
+   * Admission is checked and taken synchronously, before any await, so two requests can never both
+   * pass the busy check. A concurrent retry with the same key shares the pending result.
+   */
+  private admit<T>(key: string, work: () => Promise<T>): Promise<T> {
+    if (this.admission) {
+      if (this.admission.key === key) return this.admission.result as Promise<T>;
+      return Promise.reject(new OrchestratorError('BUSY', 409, 'Another action is being admitted; retry shortly.'));
+    }
+    const result = work();
+    const admission = { key, result };
+    this.admission = admission;
+    const release = () => { if (this.admission === admission) this.admission = undefined; };
+    result.then(release, release);
+    return result;
+  }
+
+  private async admitRun(operationKey: string): Promise<{ runId: EntityId }> {
     if (this.active?.operationKey === operationKey && this.active.kind === 'run') return { runId: this.active.runId };
     this.assertSchedulable();
     const payload = this.loadPayload();
@@ -177,7 +208,7 @@ export class Orchestrator implements OrchestratorContract {
     return this.deps.repository.updateRun(runId, { status: 'CANCELLED', finishedAt: new Date().toISOString() });
   }
 
-  async reproduce(runId: EntityId, operationKey: string): Promise<{ reproductionId: EntityId; trialIds: EntityId[] }> {
+  private async admitReproduction(runId: EntityId, operationKey: string): Promise<{ reproductionId: EntityId; trialIds: EntityId[] }> {
     const reproductionId = `${runId}-repro`;
     const trialIds = [`${runId}-repro-control`, `${runId}-repro-chaos`];
     if (this.active?.operationKey === operationKey && this.active.kind === 'reproduction') return { reproductionId, trialIds };
@@ -194,7 +225,7 @@ export class Orchestrator implements OrchestratorContract {
     return { reproductionId, trialIds };
   }
 
-  async investigate(runId: EntityId, operationKey: string): Promise<{ diagnosticId: EntityId }> {
+  private async admitDiagnostic(runId: EntityId, operationKey: string): Promise<{ diagnosticId: EntityId }> {
     const diagnosticId = `${runId}-diagnostic`;
     if (this.active?.operationKey === operationKey && this.active.kind === 'diagnostic') return { diagnosticId };
     const run = await this.requireRun(runId);

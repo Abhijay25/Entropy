@@ -4,7 +4,8 @@ import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { CATALOGUE_FALLBACK_HYPOTHESIS, DiagnosticPromptContextSchema, SERVICE_REGISTRY, type EvidenceAnalysis, type RequestSpan, type ServiceId, type ServiceMetric, type TrialTelemetry } from '../../../shared/types.js';
+import { CATALOGUE_FALLBACK_HYPOTHESIS, DiagnosticPromptContextSchema, type EvidenceAnalysis, type TrialTelemetry } from '../../../shared/types.js';
+import { realTrial } from '../../../shared/fixtures/realTrials.js';
 import { Neo4jGraphRepository } from '../graph/neo4jClient.js';
 import type { LoadedPayload } from '../sandbox/payloadManifest.js';
 import { ProviderTimeoutError, SandboxBudget, type ExecuteResult, type SandboxHandle, type SandboxLabels, type SandboxProvider, type TrustedCommand } from '../sandbox/provider.js';
@@ -15,7 +16,6 @@ import { Orchestrator, type NosanaPort } from './orchestrator.js';
 const SHA = 'c'.repeat(40);
 const PAYLOAD_HASH = 'd'.repeat(64);
 const WORKLOAD_HASH = 'e'.repeat(64);
-const PRIMARY: Record<ServiceId, 'business' | 'canary'> = { frontend: 'business', 'order-service': 'business', 'payment-service': 'business', 'auth-service': 'business', 'redis-cache': 'canary', 'postgres-db': 'canary' };
 
 const payload: LoadedPayload = {
   manifest: { schemaVersion: 1, sourceSha: SHA, archiveSha256: 'f'.repeat(64), productLockSha256: 'f'.repeat(64), buildTool: { name: 'esbuild', version: '0.28.2' }, payloadHash: PAYLOAD_HASH, files: [], topologyHash: 'a'.repeat(64), workloadHash: WORKLOAD_HASH, targetRuntime: 'node22', sandboxImage: 'test-image', createdAt: '2026-01-01T00:00:00.000Z', development: false },
@@ -27,29 +27,9 @@ vi.mock('../sandbox/payloadManifest.js', async (importOriginal) => ({
   loadPreparedPayload: () => payload
 }));
 
-function metric(trialId: string, serviceId: ServiceId, status: ServiceMetric['status'], errors = 0): ServiceMetric {
-  const completed = 20;
-  return { id: `${trialId}:${serviceId}:${PRIMARY[serviceId]}`, serviceId, channel: PRIMARY[serviceId], status, requestsStarted: completed, requestsCompleted: completed, errorsTotal: errors, timeoutsTotal: 0, errorRate: errors / completed, latencyP50Ms: 5, latencyP95Ms: status === 'HEALTHY' ? 10 : 3000, latencyP99Ms: 10, sampleCount: completed, smallSample: false };
-}
-
-/** A synthetic but schema-valid payload report derived from the uploaded input.json. */
+/** A real payload report (shared/fixtures), re-identified for the uploaded input.json. */
 function syntheticReport(input: { runId: string; trialId: string; kind: TrialTelemetry['kind']; fault: unknown }): TrialTelemetry {
-  const chaos = input.fault !== null;
-  const at = '2026-01-01T00:00:00.000Z';
-  const trace = `${input.trialId}-co-0001`;
-  const span = (id: string, serviceId: ServiceId, faultApplied = false): RequestSpan => ({ id: `${trace}:${id}`, kind: 'server', traceId: trace, serviceId, channel: 'business', startedAt: at, durationMs: faultApplied ? 3000 : 5, statusCode: 200, faultApplied });
-  const affected: ServiceId[] = ['frontend', 'order-service', 'payment-service', 'auth-service', 'redis-cache'];
-  return {
-    id: input.trialId, runId: input.runId, kind: input.kind, status: 'COMPLETED', executionMode: 'development-local', cleanupStatus: 'NOT_CREATED', startedAt: at, finishedAt: at,
-    sourceSha: SHA, payloadHash: PAYLOAD_HASH, workloadHash: WORKLOAD_HASH, runtimeIdentity: 'node', faultWitnessed: chaos,
-    metrics: SERVICE_REGISTRY.map((node) => metric(input.trialId, node.id, chaos && affected.includes(node.id) ? (node.id === 'redis-cache' || node.id === 'auth-service' ? 'DEGRADED' : 'DOWN') : 'HEALTHY', chaos && ['frontend', 'order-service', 'payment-service'].includes(node.id) ? 20 : 0)),
-    spans: chaos ? [span('1', 'frontend'), span('2', 'order-service'), span('3', 'payment-service'), span('4', 'auth-service'), span('5', 'redis-cache', true)] : [],
-    artifacts: [],
-    clientSummary: chaos
-      ? { scheduled: 130, started: 130, completed: 130, skipped: 0, errors: 110, checkoutStarted: 100, checkoutCompleted: 100, checkoutErrors: 100, checkoutErrorRate: 1, checkoutP95Ms: 1200, businessSkipped: 0, sessionCompleted: 10, redisCanaryCompleted: 10, postgresCanaryCompleted: 10 }
-      : { scheduled: 130, started: 130, completed: 130, skipped: 0, errors: 0, checkoutStarted: 100, checkoutCompleted: 100, checkoutErrors: 0, checkoutErrorRate: 0, checkoutP95Ms: 20, businessSkipped: 0, sessionCompleted: 10, redisCanaryCompleted: 10, postgresCanaryCompleted: 10 },
-    validity: 'valid', warnings: []
-  };
+  return realTrial(input.fault !== null ? 'chaos' : 'control', { id: input.trialId, runId: input.runId, kind: input.kind, sourceSha: SHA, payloadHash: PAYLOAD_HASH, workloadHash: WORKLOAD_HASH });
 }
 
 class FakeProvider implements SandboxProvider {
@@ -67,6 +47,8 @@ class FakeProvider implements SandboxProvider {
   failDeleteFor = new Set<string>();
   failExecuteFor = new Set<string>();
   executeDelayMs = 20;
+  /** Corrupts one collected evidence file for the given trial kind. */
+  corrupt?: { kind: TrialTelemetry['kind']; file: 'spans' | 'witness' | 'witness-mode' };
   hangExecute = false;
 
   async create(labels: SandboxLabels): Promise<SandboxHandle> {
@@ -98,10 +80,17 @@ class FakeProvider implements SandboxProvider {
     if (!fs) throw new Error('sandbox deleted');
     const input = JSON.parse(fs.get('input.json')!.toString('utf8')) as Parameters<typeof syntheticReport>[0];
     if (this.failExecuteFor.has(input.kind)) return { exitCode: 2, output: 'runTrial failed: synthetic' };
-    fs.set('out/trial.json', Buffer.from(JSON.stringify({ schemaVersion: 1, ...syntheticReport(input) })));
+    const report = syntheticReport(input);
+    const delayedRedis = report.spans.filter((span) => span.kind === 'server' && span.serviceId === 'redis-cache' && span.faultApplied);
+    const witnessIds = delayedRedis.filter((span) => span.channel === 'business').map((span) => span.id);
+    const canaryWitnessIds = delayedRedis.filter((span) => span.channel === 'canary').map((span) => span.id);
+    fs.set('out/trial.json', Buffer.from(JSON.stringify({ schemaVersion: 1, ...report })));
     fs.set('out/runtime.json', Buffer.from(JSON.stringify({ payloadHash: PAYLOAD_HASH, observed: { node: 'v22.12.0', platform: 'linux', arch: 'x64' } })));
-    fs.set('out/spans.jsonl', Buffer.from('\n'));
-    fs.set('out/fault-witness.json', Buffer.from('{}'));
+    const corrupt = this.corrupt?.kind === input.kind ? this.corrupt.file : undefined;
+    const spans = corrupt === 'spans' ? report.spans.slice(1) : report.spans;
+    fs.set('out/spans.jsonl', Buffer.from(spans.map((span) => JSON.stringify(span)).join('\n') + '\n'));
+    const mode = input.fault !== null ? 'redis_latency' : 'healthy';
+    fs.set('out/fault-witness.json', Buffer.from(JSON.stringify({ fault: { mode: corrupt === 'witness-mode' ? (mode === 'healthy' ? 'redis_latency' : 'healthy') : mode }, businessWitnessSpanIds: corrupt === 'witness' ? witnessIds.slice(1) : witnessIds, canaryWitnessSpanIds: canaryWitnessIds })));
     fs.set('out/terminal.log', Buffer.from('ok\n'));
     return { exitCode: 0, output: '{}' };
   }
@@ -192,6 +181,51 @@ describe('Orchestrator', () => {
     const { runId } = await orchestrator.startRun('34343434-3434-4343-8343-343434343434');
     await orchestrator.idle();
     expect((await repository.getRun(runId))!.warnings).toContain('DEVELOPMENT graph store: in-memory, not Neo4j.');
+  });
+
+  it.each([
+    ['spans', 'raw spans.jsonl disagrees with the report'],
+    ['witness', 'controller witness list disagrees with the delayed spans'],
+    ['witness-mode', 'controller fault mode disagrees with the trial kind']
+  ] as const)('rejects a chaos report whose %s evidence contradicts it (%s)', async (file, _description) => {
+    const provider = new FakeProvider();
+    provider.corrupt = { kind: 'chaos', file };
+    const { orchestrator, repository } = setup({ provider });
+    const { runId } = await orchestrator.startRun(`7${file.length}7${file.length}7${file.length}7${file.length}-7777-4777-8777-777777777777`.slice(0, 36));
+    await orchestrator.idle();
+    const run = (await repository.getRun(runId))!;
+    expect(run.trials.find((trial) => trial.kind === 'chaos')).toMatchObject({ status: 'FAILED', error: { code: 'REPORT_EVIDENCE_MISMATCH' } });
+    expect(run.status).toBe('FAILED');
+    expect(run.actualBlastRadiusIds).toEqual([]);
+  });
+
+  it('admits exactly one workflow when different-key requests race through async admission', async () => {
+    const repository = new Neo4jGraphRepository({ inMemory: true });
+    const claim = repository.claimOperationKey.bind(repository);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let waiting = 0;
+    repository.claimOperationKey = async (...args: Parameters<typeof claim>) => { waiting += 1; await gate; return claim(...args); };
+    const { orchestrator } = setup({ repository });
+    const first = orchestrator.startRun('aaaaaaaa-0000-4000-8000-000000000001');
+    const second = orchestrator.startRun('aaaaaaaa-0000-4000-8000-000000000002');
+    const third = orchestrator.reproduce('anything', 'aaaaaaaa-0000-4000-8000-000000000003');
+    await vi.waitFor(() => expect(waiting).toBeGreaterThanOrEqual(1));
+    release();
+    const results = await Promise.allSettled([first, second, third]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected').map((result) => (result as PromiseRejectedResult).reason)).toEqual([expect.objectContaining({ httpStatus: 409 }), expect.objectContaining({ httpStatus: 409 })]);
+    await orchestrator.idle();
+    expect((await repository.listRuns(20))).toHaveLength(1);
+  });
+
+  it('returns one run for concurrent same-key requests', async () => {
+    const { orchestrator, repository } = setup();
+    const key = 'bbbbbbbb-0000-4000-8000-000000000001';
+    const [left, right] = await Promise.all([orchestrator.startRun(key), orchestrator.startRun(key)]);
+    expect(left).toEqual(right);
+    await orchestrator.idle();
+    expect((await repository.listRuns(20))).toHaveLength(1);
   });
 
   it('stops after an invalid baseline without scheduling matched trials', async () => {
