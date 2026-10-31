@@ -14,3 +14,5 @@ Document precedence:
 Put new implementation specifications and decisions in this `spec/` directory. Keep one active plan, update its contracts when scope changes, and identify superseded documents explicitly so coding agents do not combine incompatible architectures.
 
 Coding-agent prompts and the two-person schedule are in section 12 of the active plan. Connection details belong in local environment configuration; secrets never belong in specifications.
+
+The [Claude review handoff](claude-review-prompt.md) records the sandbox-isolation and blast-radius accuracy audit, concrete reproductions, and prioritized corrections. Recheck findings against current code before applying fixes; this handoff supplements the active plan.
