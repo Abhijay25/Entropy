@@ -6,6 +6,7 @@ import {
   DEFAULT_CONFIGURED_TOPOLOGY,
   DEV_FIXTURE_DIAGNOSTIC_SESSION,
   DEV_FIXTURE_RUN_SNAPSHOT,
+  DependencyEdgeSchema,
   DiagnosticSessionSchema,
   EvidenceAnalysisSchema,
   RunSnapshotSchema,
@@ -95,12 +96,26 @@ function chaosTrial(): TrialTelemetry {
   trial.metrics = serviceIds.map((serviceId) => metric(serviceId, serviceId === 'postgres-db' ? 'HEALTHY' : 'DEGRADED'));
   trial.spans = [
     { id: 'span-frontend', kind: 'server', traceId: 'trace-1', serviceId: 'frontend', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+    { id: 'client-frontend-order', kind: 'client', traceId: 'trace-1', serviceId: 'frontend', downstreamId: 'order-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
     { id: 'span-order', kind: 'server', traceId: 'trace-1', serviceId: 'order-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+    { id: 'client-order-payment', kind: 'client', traceId: 'trace-1', serviceId: 'order-service', downstreamId: 'payment-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
     { id: 'span-payment', kind: 'server', traceId: 'trace-1', serviceId: 'payment-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+    { id: 'client-payment-auth', kind: 'client', traceId: 'trace-1', serviceId: 'payment-service', downstreamId: 'auth-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
     { id: 'span-auth', kind: 'server', traceId: 'trace-1', serviceId: 'auth-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+    { id: 'client-auth-redis', kind: 'client', traceId: 'trace-1', serviceId: 'auth-service', downstreamId: 'redis-cache', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
     { id: 'span-redis-witness', kind: 'server', traceId: 'trace-1', serviceId: 'redis-cache', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: true }
   ];
   return trial;
+}
+
+function reproductionTrials() {
+  const control = controlTrial();
+  control.id = 'reproduction-control-trial';
+  control.kind = 'reproduction-control';
+  const chaos = chaosTrial();
+  chaos.id = 'reproduction-chaos-trial';
+  chaos.kind = 'reproduction-chaos';
+  return { control, chaos };
 }
 
 function runSnapshot(control: TrialTelemetry, chaos: TrialTelemetry) {
@@ -139,6 +154,59 @@ describe('strict executable schemas', () => {
       expect(schema.safeParse({ ...value, unexpected: true }).success).toBe(false);
     });
   }
+
+  it('enforces edge, blast-radius uniqueness, and inconclusive snapshot invariants', () => {
+    expect(DependencyEdgeSchema.safeParse({
+      id: 'observed:1',
+      source: 'redis-cache',
+      target: 'auth-service',
+      relationship: 'CASCADED_TO',
+      evidenceKind: 'observed',
+      circuitBreaker: false,
+      supportingSpanIds: ['span-1']
+    }).success).toBe(true);
+
+    expect(DependencyEdgeSchema.safeParse({
+      id: 'observed:empty',
+      source: 'redis-cache',
+      target: 'auth-service',
+      relationship: 'CASCADED_TO',
+      evidenceKind: 'observed',
+      circuitBreaker: false,
+      supportingSpanIds: []
+    }).success).toBe(false);
+
+    expect(DependencyEdgeSchema.safeParse({
+      id: 'observed:configured',
+      source: 'redis-cache',
+      target: 'auth-service',
+      relationship: 'CASCADED_TO',
+      evidenceKind: 'configured',
+      circuitBreaker: false,
+      supportingSpanIds: ['span-1']
+    }).success).toBe(false);
+
+    expect(DependencyEdgeSchema.safeParse({
+      id: 'calls:observed',
+      source: 'auth-service',
+      target: 'redis-cache',
+      relationship: 'READS',
+      evidenceKind: 'observed',
+      circuitBreaker: false,
+      supportingSpanIds: ['span-1']
+    }).success).toBe(false);
+
+    expect(ChaosHypothesisSchema.safeParse({
+      ...CATALOGUE_FALLBACK_HYPOTHESIS,
+      predictedBlastRadiusIds: ['redis-cache', 'redis-cache']
+    }).success).toBe(false);
+
+    expect(RunSnapshotSchema.safeParse({
+      ...DEV_FIXTURE_RUN_SNAPSHOT,
+      comparisonValidity: 'inconclusive',
+      actualBlastRadiusIds: ['redis-cache']
+    }).success).toBe(false);
+  });
 });
 
 describe('trial quality evaluation', () => {
@@ -152,10 +220,29 @@ describe('trial quality evaluation', () => {
     truncated.artifacts = [{ id: 'spans', kind: 'spans', sizeBytes: 10, sha256: contentHash, truncated: true, available: true }];
     expect(evaluateBaselineTrial(truncated)).toMatchObject({ validity: 'inconclusive', reasons: expect.arrayContaining(['Required evidence is incomplete.']) });
 
-    const wrongState = controlTrial();
-    wrongState.status = 'RUNNING';
-    wrongState.faultWitnessed = true;
-    expect(evaluateBaselineTrial(wrongState).validity).toBe('inconclusive');
+    const wrongStatus = controlTrial();
+    wrongStatus.status = 'RUNNING';
+    expect(evaluateBaselineTrial(wrongStatus)).toMatchObject({ validity: 'inconclusive', reasons: ['Trial did not complete.'] });
+
+    const unexpectedWitness = controlTrial();
+    unexpectedWitness.faultWitnessed = true;
+    expect(evaluateBaselineTrial(unexpectedWitness)).toMatchObject({ validity: 'inconclusive', reasons: ['Healthy trial recorded a fault witness.'] });
+
+    const wrongKind = controlTrial();
+    wrongKind.kind = 'chaos';
+    expect(evaluateBaselineTrial(wrongKind)).toMatchObject({ validity: 'inconclusive', reasons: ['Healthy trial has an invalid kind.'] });
+
+    const withErrors = controlTrial();
+    withErrors.clientSummary.errors = 1;
+    expect(evaluateBaselineTrial(withErrors)).toMatchObject({ validity: 'inconclusive', reasons: ['Healthy trial did not complete 130 error-free requests.'] });
+
+    const degradedPrimary = controlTrial();
+    degradedPrimary.metrics = degradedPrimary.metrics.map((value) => value.serviceId === 'payment-service' ? metric('payment-service', 'DEGRADED') : value);
+    expect(evaluateBaselineTrial(degradedPrimary)).toMatchObject({ validity: 'inconclusive', reasons: ['Primary metric for payment-service is not HEALTHY.'] });
+
+    const invalidBaselineReport = controlTrial();
+    invalidBaselineReport.validity = 'invalid';
+    expect(evaluateBaselineTrial(invalidBaselineReport)).toMatchObject({ validity: 'inconclusive', reasons: ['Trial report is not valid.'] });
   });
 
   it('requires sufficient chaos samples and a delayed Redis business witness', () => {
@@ -188,10 +275,71 @@ describe('trial quality evaluation', () => {
     sessionOnlyWitness.spans = sessionOnlyWitness.spans.filter((span) => !['order-service', 'payment-service'].includes(span.serviceId));
     expect(evaluateChaosTrial(sessionOnlyWitness).validity).toBe('inconclusive');
 
-    const wrongState = chaosTrial();
-    wrongState.status = 'RUNNING';
-    wrongState.kind = 'control';
-    expect(evaluateChaosTrial(wrongState).validity).toBe('inconclusive');
+    const wrongStatus = chaosTrial();
+    wrongStatus.status = 'RUNNING';
+    expect(evaluateChaosTrial(wrongStatus)).toMatchObject({ validity: 'inconclusive', reasons: ['Trial did not complete.'] });
+
+    const wrongKind = chaosTrial();
+    wrongKind.kind = 'control';
+    expect(evaluateChaosTrial(wrongKind)).toMatchObject({ validity: 'inconclusive', reasons: ['Chaos trial has an invalid kind.'] });
+
+    const invalidChaosReport = chaosTrial();
+    invalidChaosReport.validity = 'invalid';
+    expect(evaluateChaosTrial(invalidChaosReport)).toMatchObject({ validity: 'inconclusive', reasons: ['Chaos report is not valid.'] });
+
+    const missingSessions = chaosTrial();
+    missingSessions.clientSummary.sessionCompleted = 8;
+    expect(evaluateChaosTrial(missingSessions)).toMatchObject({ validity: 'inconclusive', reasons: ['Insufficient session samples.'] });
+
+    const missingPostgresCanaries = chaosTrial();
+    missingPostgresCanaries.clientSummary.postgresCanaryCompleted = 8;
+    expect(evaluateChaosTrial(missingPostgresCanaries)).toMatchObject({ validity: 'inconclusive', reasons: ['Insufficient Postgres canary samples.'] });
+
+    const truncatedChaos = chaosTrial();
+    truncatedChaos.artifacts = [{ id: 'spans', kind: 'spans', sizeBytes: 10, sha256: contentHash, truncated: true, available: true }];
+    expect(evaluateChaosTrial(truncatedChaos)).toMatchObject({ validity: 'inconclusive', reasons: ['Required evidence is incomplete.'] });
+
+    const overflowedSpans = chaosTrial();
+    overflowedSpans.spans = [
+      ...overflowedSpans.spans,
+      ...Array.from({ length: 3000 - overflowedSpans.spans.length }, (_, index) => ({
+        id: `extra-span-${index}`,
+        kind: 'server' as const,
+        traceId: 'trace-extra',
+        serviceId: 'frontend' as const,
+        channel: 'business' as const,
+        startedAt: timestamp,
+        durationMs: 10,
+        faultApplied: false
+      }))
+    ];
+    expect(evaluateChaosTrial(overflowedSpans)).toMatchObject({ validity: 'inconclusive', reasons: ['Required evidence is incomplete.'] });
+
+    const spanDerivedFailing = chaosTrial();
+    delete spanDerivedFailing.clientSummary.sessionCompleted;
+    delete spanDerivedFailing.clientSummary.redisCanaryCompleted;
+    delete spanDerivedFailing.clientSummary.postgresCanaryCompleted;
+    expect(evaluateChaosTrial(spanDerivedFailing)).toMatchObject({
+      validity: 'inconclusive',
+      reasons: [
+        'Insufficient session samples.',
+        'Insufficient Redis canary samples.',
+        'Insufficient Postgres canary samples.'
+      ]
+    });
+
+    const spanDerivedPassing = chaosTrial();
+    delete spanDerivedPassing.clientSummary.sessionCompleted;
+    delete spanDerivedPassing.clientSummary.redisCanaryCompleted;
+    delete spanDerivedPassing.clientSummary.postgresCanaryCompleted;
+    for (let index = 0; index < 9; index += 1) {
+      spanDerivedPassing.spans.push(
+        { id: `session-span-${index}`, kind: 'server', traceId: `session-trace-${index}`, serviceId: 'frontend', channel: 'business', startedAt: timestamp, durationMs: 10, faultApplied: false },
+        { id: `redis-canary-span-${index}`, kind: 'server', traceId: `redis-canary-trace-${index}`, serviceId: 'redis-cache', channel: 'canary', startedAt: timestamp, durationMs: 10, faultApplied: false },
+        { id: `postgres-canary-span-${index}`, kind: 'server', traceId: `postgres-canary-trace-${index}`, serviceId: 'postgres-db', channel: 'canary', startedAt: timestamp, durationMs: 10, faultApplied: false }
+      );
+    }
+    expect(evaluateChaosTrial(spanDerivedPassing)).toEqual({ validity: 'valid', reasons: [] });
   });
 });
 
@@ -200,10 +348,14 @@ describe('matched trial blast-radius evaluation', () => {
     const result = evaluateMatchedPairAndBlastRadius(controlTrial(), chaosTrial());
     expect(result.comparisonValidity).toBe('valid');
     expect(result.actualBlastRadiusIds).toEqual(['frontend', 'order-service', 'payment-service', 'auth-service', 'redis-cache']);
-    expect(result.observedCascadeEdges).toEqual(expect.arrayContaining([
+    expect(result.observedCascadeEdges).toEqual([
       expect.objectContaining({ source: 'order-service', target: 'frontend', relationship: 'CASCADED_TO', evidenceKind: 'observed' }),
-      expect.objectContaining({ source: 'auth-service', target: 'payment-service', relationship: 'CASCADED_TO', evidenceKind: 'observed' }),
-      expect.objectContaining({ source: 'redis-cache', target: 'auth-service', relationship: 'CASCADED_TO', evidenceKind: 'observed' })
+      expect.objectContaining({ source: 'payment-service', target: 'order-service', relationship: 'CASCADED_TO', evidenceKind: 'observed' }),
+      expect.objectContaining({ source: 'redis-cache', target: 'auth-service', relationship: 'CASCADED_TO', evidenceKind: 'observed' }),
+      expect.objectContaining({ source: 'auth-service', target: 'payment-service', relationship: 'CASCADED_TO', evidenceKind: 'observed' })
+    ]);
+    expect(result.observedCascadeEdges).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: 'auth-service', target: 'frontend' })
     ]));
     expect(result.observedCascadeEdges.every((edge) => edge.supportingSpanIds.includes('span-redis-witness'))).toBe(true);
     expect(result.actualBlastRadiusIds).not.toContain('postgres-db');
@@ -220,6 +372,39 @@ describe('matched trial blast-radius evaluation', () => {
     const unknownResult = evaluateMatchedPairAndBlastRadius(controlTrial(), unknownAuth);
     expect(unknownResult.comparisonValidity).toBe('valid');
     expect(unknownResult.actualBlastRadiusIds).not.toContain('auth-service');
+
+    const degradedPostgres = chaosTrial();
+    degradedPostgres.metrics = degradedPostgres.metrics.map((value) => value.serviceId === 'postgres-db' ? metric('postgres-db', 'DEGRADED') : value);
+    degradedPostgres.spans.push({ id: 'span-postgres', kind: 'server', traceId: 'trace-1', serviceId: 'postgres-db', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false });
+    const postgresResult = evaluateMatchedPairAndBlastRadius(controlTrial(), degradedPostgres);
+    expect(postgresResult.comparisonValidity).toBe('valid');
+    expect(postgresResult.actualBlastRadiusIds).not.toContain('postgres-db');
+
+    const unlinkedOrder = chaosTrial();
+    unlinkedOrder.spans = [
+      { id: 'span-payment', kind: 'server', traceId: 'trace-1', serviceId: 'payment-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+      { id: 'client-payment-auth', kind: 'client', traceId: 'trace-1', serviceId: 'payment-service', downstreamId: 'auth-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+      { id: 'span-auth', kind: 'server', traceId: 'trace-1', serviceId: 'auth-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+      { id: 'client-auth-redis', kind: 'client', traceId: 'trace-1', serviceId: 'auth-service', downstreamId: 'redis-cache', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+      { id: 'span-redis-witness', kind: 'server', traceId: 'trace-1', serviceId: 'redis-cache', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: true },
+      { id: 'span-order-unlinked', kind: 'server', traceId: 'trace-2', serviceId: 'order-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false }
+    ];
+    const unlinkedOrderResult = evaluateMatchedPairAndBlastRadius(controlTrial(), unlinkedOrder);
+    expect(unlinkedOrderResult.comparisonValidity).toBe('valid');
+    expect(unlinkedOrderResult.actualBlastRadiusIds).not.toContain('order-service');
+
+    const withSessionWitness = chaosTrial();
+    withSessionWitness.spans.push(
+      { id: 'span-session-frontend', kind: 'server', traceId: 'trace-session', serviceId: 'frontend', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+      { id: 'client-session-frontend-auth', kind: 'client', traceId: 'trace-session', serviceId: 'frontend', downstreamId: 'auth-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+      { id: 'span-session-auth', kind: 'server', traceId: 'trace-session', serviceId: 'auth-service', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+      { id: 'client-session-auth-redis', kind: 'client', traceId: 'trace-session', serviceId: 'auth-service', downstreamId: 'redis-cache', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: false },
+      { id: 'span-session-redis-witness', kind: 'server', traceId: 'trace-session', serviceId: 'redis-cache', channel: 'business', startedAt: timestamp, durationMs: 3000, faultApplied: true }
+    );
+    const sessionEdgeResult = evaluateMatchedPairAndBlastRadius(controlTrial(), withSessionWitness);
+    expect(sessionEdgeResult.observedCascadeEdges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: 'auth-service', target: 'frontend', relationship: 'CASCADED_TO', evidenceKind: 'observed' })
+    ]));
   });
 
   it('returns inconclusive, not zero impact, when witness or matched identity gates fail', () => {
@@ -229,11 +414,37 @@ describe('matched trial blast-radius evaluation', () => {
     const witnessResult = evaluateMatchedPairAndBlastRadius(controlTrial(), missingWitness);
     expect(witnessResult).toMatchObject({ comparisonValidity: 'inconclusive', actualBlastRadiusIds: [] });
 
-    const mismatched = chaosTrial();
-    mismatched.workloadHash = 'c'.repeat(64);
-    mismatched.runId = 'another-run';
-    const identityResult = evaluateMatchedPairAndBlastRadius(controlTrial(), mismatched);
-    expect(identityResult).toMatchObject({ comparisonValidity: 'inconclusive', actualBlastRadiusIds: [] });
+    const mismatchedWorkload = chaosTrial();
+    mismatchedWorkload.workloadHash = 'c'.repeat(64);
+    expect(evaluateMatchedPairAndBlastRadius(controlTrial(), mismatchedWorkload)).toMatchObject({
+      comparisonValidity: 'inconclusive',
+      comparisonReasons: ['Matched trials have different immutable identities.'],
+      actualBlastRadiusIds: []
+    });
+
+    const mismatchedRun = chaosTrial();
+    mismatchedRun.runId = 'another-run';
+    expect(evaluateMatchedPairAndBlastRadius(controlTrial(), mismatchedRun)).toMatchObject({
+      comparisonValidity: 'inconclusive',
+      comparisonReasons: ['Matched trials have different immutable identities.'],
+      actualBlastRadiusIds: []
+    });
+
+    const mismatchedMode = chaosTrial();
+    mismatchedMode.executionMode = 'daytona';
+    expect(evaluateMatchedPairAndBlastRadius(controlTrial(), mismatchedMode)).toMatchObject({
+      comparisonValidity: 'inconclusive',
+      comparisonReasons: ['Matched trials have different execution modes.'],
+      actualBlastRadiusIds: []
+    });
+
+    const mismatchedKinds = chaosTrial();
+    mismatchedKinds.kind = 'reproduction-chaos';
+    expect(evaluateMatchedPairAndBlastRadius(controlTrial(), mismatchedKinds)).toMatchObject({
+      comparisonValidity: 'inconclusive',
+      comparisonReasons: ['Matched trials have incompatible kinds.'],
+      actualBlastRadiusIds: []
+    });
   });
 });
 
@@ -243,30 +454,62 @@ describe('reproduction classification', () => {
     const originalChaos = chaosTrial();
     const original = runSnapshot(originalControl, originalChaos);
 
-    expect(classifyReproduction(original, controlTrial(), chaosTrial()).classification).toBe('reproduced');
+    const reproducedPair = reproductionTrials();
+    expect(classifyReproduction(original, reproducedPair.control, reproducedPair.chaos).classification).toBe('reproduced');
 
-    const partial = chaosTrial();
-    partial.metrics = partial.metrics.map((value) => value.serviceId === 'redis-cache' ? value : metric(value.serviceId));
-    partial.clientSummary.checkoutErrors = 10;
-    partial.clientSummary.checkoutErrorRate = 0.1;
-    expect(classifyReproduction(original, controlTrial(), partial).classification).toBe('partial');
+    const partialPair = reproductionTrials();
+    partialPair.chaos.metrics = partialPair.chaos.metrics.map((value) => value.serviceId === 'redis-cache' ? value : metric(value.serviceId));
+    partialPair.chaos.clientSummary.checkoutErrors = 10;
+    partialPair.chaos.clientSummary.checkoutErrorRate = 0.1;
+    expect(classifyReproduction(original, partialPair.control, partialPair.chaos).classification).toBe('partial');
 
-    const noImpact = chaosTrial();
-    noImpact.metrics = noImpact.metrics.map((value) => metric(value.serviceId));
-    noImpact.clientSummary.checkoutErrors = 0;
-    noImpact.clientSummary.checkoutErrorRate = 0;
-    expect(classifyReproduction(original, controlTrial(), noImpact).classification).toBe('not_reproduced');
+    const noImpactPair = reproductionTrials();
+    noImpactPair.chaos.metrics = noImpactPair.chaos.metrics.map((value) => metric(value.serviceId));
+    noImpactPair.chaos.clientSummary.checkoutErrors = 0;
+    noImpactPair.chaos.clientSummary.checkoutErrorRate = 0;
+    expect(classifyReproduction(original, noImpactPair.control, noImpactPair.chaos).classification).toBe('not_reproduced');
 
-    const invalid = chaosTrial();
-    invalid.faultWitnessed = false;
-    invalid.spans = [];
-    const invalidResult = classifyReproduction(original, controlTrial(), invalid);
+    const invalidPair = reproductionTrials();
+    invalidPair.chaos.faultWitnessed = false;
+    invalidPair.chaos.spans = [];
+    const invalidResult = classifyReproduction(original, invalidPair.control, invalidPair.chaos);
     expect(invalidResult.classification).toBe('inconclusive');
     expect(invalidResult.reasons).toContain('Chaos trial did not record a fault witness.');
 
-    const mismatchedIdentity = chaosTrial();
-    mismatchedIdentity.payloadHash = 'c'.repeat(64);
-    const identityResult = classifyReproduction(original, controlTrial(), mismatchedIdentity);
+    const mismatchedIdentityPair = reproductionTrials();
+    mismatchedIdentityPair.chaos.payloadHash = 'c'.repeat(64);
+    const identityResult = classifyReproduction(original, mismatchedIdentityPair.control, mismatchedIdentityPair.chaos);
     expect(identityResult).toMatchObject({ classification: 'inconclusive', reasons: ['Reproduction pair identities do not match the original pair.'] });
+
+    expect(classifyReproduction(original, controlTrial(), chaosTrial())).toMatchObject({
+      classification: 'inconclusive',
+      reasons: ['Reproduction trials must use reproduction-control and reproduction-chaos kinds.']
+    });
+
+    const reusedIdsPair = reproductionTrials();
+    reusedIdsPair.control.id = originalControl.id;
+    expect(classifyReproduction(original, reusedIdsPair.control, reusedIdsPair.chaos)).toMatchObject({
+      classification: 'inconclusive',
+      reasons: ['Reproduction trials must have new trial IDs.']
+    });
+
+    const mismatchedModePair = reproductionTrials();
+    mismatchedModePair.chaos.executionMode = 'daytona';
+    expect(classifyReproduction(original, mismatchedModePair.control, mismatchedModePair.chaos)).toMatchObject({
+      classification: 'inconclusive',
+      reasons: ['Reproduction pair execution modes do not match the original pair.']
+    });
+
+    const invalidOriginal = { ...original, comparisonValidity: 'inconclusive' as const, comparisonReasons: ['Original control failed.'] };
+    expect(classifyReproduction(invalidOriginal, reproducedPair.control, reproducedPair.chaos)).toMatchObject({
+      classification: 'inconclusive',
+      reasons: ['Original control failed.']
+    });
+
+    const missingOriginalTrials = { ...original, trials: [originalControl] };
+    expect(classifyReproduction(missingOriginalTrials, reproducedPair.control, reproducedPair.chaos)).toMatchObject({
+      classification: 'inconclusive',
+      reasons: ['Original run does not contain a matched control and chaos pair.']
+    });
   });
 });

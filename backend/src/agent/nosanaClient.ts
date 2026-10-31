@@ -6,6 +6,7 @@ import {
   DiagnosticActionSchema,
   EvidenceAnalysisSchema,
   FIXED_RISK_CYPHER_QUERY,
+  PRIMARY_CHANNEL_BY_SERVICE,
   type ChaosHypothesis,
   type DiagnosticAction,
   type DiagnosticPromptContext,
@@ -57,7 +58,7 @@ interface CachedHealth extends NosanaHealth { expiresAt: number }
 interface Completion { content: string; usage?: unknown; latencyMs: number; createdAt: string }
 interface EvidenceIds { metricIds: Set<string>; spanIds: Set<string> }
 
-export class NosanaClient implements Omit<NosanaClientContract, 'hypothesize'> {
+export class NosanaClient implements NosanaClientContract {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
   private readonly model?: string;
@@ -121,10 +122,9 @@ export class NosanaClient implements Omit<NosanaClientContract, 'hypothesize'> {
 
   async analyze(evidence: ValidatedEvidenceInput, control?: RequestControl): Promise<EvidenceAnalysis> {
     const requestControl = normalizeControl(control, this.now);
-    const prompt = buildEvidencePrompt(evidence);
-    const allowed = evidenceIdsFromPrompt(prompt);
-
     try {
+      const prompt = buildEvidencePrompt(evidence);
+      const allowed = evidenceIdsFromPrompt(prompt);
       const draft = await this.requestValidJson(prompt, (value) => validateAnalysis(value, allowed), requestControl);
       const metadata = this.requireMetadata();
       return EvidenceAnalysisSchema.parse({
@@ -146,7 +146,7 @@ export class NosanaClient implements Omit<NosanaClientContract, 'hypothesize'> {
     const evidencePrompt = buildEvidencePrompt(context.evidence);
     const analysisData = JSON.parse(evidencePrompt) as { evidence: unknown; measurementIds: { metricIds: string[]; spanIds: string[] } };
     const allowed = evidenceIdsFromPrompt(evidencePrompt);
-    const toolTrace = (context as unknown as { toolTrace?: unknown }).toolTrace ?? [];
+    const toolTrace = context.toolTrace ?? [];
     const prompt = JSON.stringify({
       task: 'Choose exactly one diagnostic action as JSON only.',
       evidence: analysisData.evidence,
@@ -212,7 +212,7 @@ export class NosanaClient implements Omit<NosanaClientContract, 'hypothesize'> {
         } finally { dispose(); }
       } catch (error) {
         lastError = error;
-        if (control?.signal?.aborted) break;
+        if (control?.signal?.aborted || isDeadlineExpired(control?.deadlineMs, this.now)) break;
         if (isTransient(error)) {
           transientFailure = true;
           if (attempt === 0) continue;
@@ -241,37 +241,77 @@ export class NosanaClient implements Omit<NosanaClientContract, 'hypothesize'> {
 }
 
 export function buildEvidencePrompt(evidence: ValidatedEvidenceInput): string {
-  const metrics = [...evidence.control.metrics, ...evidence.chaos.metrics];
-  const queueCounters = metrics.map(({ id, serviceId, activeSlotsPeak, longestSaturatedIntervalMs, queueLengthPeak, requestsQueued, queueRejected }) => ({ id, serviceId, activeSlotsPeak, longestSaturatedIntervalMs, queueLengthPeak, requestsQueued, queueRejected }));
-  const faultWitnesses = evidence.chaos.spans.filter((span) => span.faultApplied).slice(0, 20).map(compactSpan);
-  const witnessIds = faultWitnesses.map((witness) => witness.id);
-  const base = {
-    task: 'Explain supplied measured evidence only as JSON.',
-    instructions: ['Do not overwrite calculated counts, percentiles, or statuses.', 'Every hypothesis needs one allowed metricId.', 'Use only allowed metricIds and spanIds.'],
-    evidence: { changedMetrics: { control: evidence.control.metrics, chaos: evidence.chaos.metrics }, queueCounters, faultWitnesses, actualBlastRadiusIds: evidence.comparison.actualBlastRadiusIds, supportingSpans: [] as ReturnType<typeof compactSpan>[] },
-    measurementIds: { metricIds: metrics.map((metric) => metric.id), spanIds: witnessIds },
-    outputSchema: { summary: 'string', hypotheses: [{ explanation: 'string', metricIds: ['allowed metric ID'], spanIds: ['allowed span ID'] }], remediation: [{ proposal: 'string', limitation: 'string', metricIds: ['allowed metric ID'] }] }
-  };
-  const spans = [...evidence.chaos.spans, ...evidence.control.spans].map(compactSpan);
+  const controlMetrics = selectPromptMetrics(evidence.control.metrics ?? [], evidence.chaos.metrics ?? []);
+  const chaosMetrics = selectPromptMetrics(evidence.chaos.metrics ?? [], evidence.control.metrics ?? []);
+  const faultWitnesses = (evidence.chaos.spans ?? []).filter((span) => span.faultApplied).slice(0, 20).map(compactSpan);
+  const supportingSpans = [...(evidence.chaos.spans ?? []), ...(evidence.control.spans ?? [])].map(compactSpan);
   let low = 0;
-  let high = spans.length;
+  let high = supportingSpans.length;
   while (low < high) {
     const middle = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(serializeEvidencePrompt(base, spans.slice(0, middle), witnessIds)) <= MAX_EVIDENCE_PROMPT_BYTES) low = middle;
+    if (Buffer.byteLength(serializeEvidencePrompt(evidence, controlMetrics, chaosMetrics, faultWitnesses, supportingSpans.slice(0, middle))) <= MAX_EVIDENCE_PROMPT_BYTES) low = middle;
     else high = middle - 1;
   }
-  const prompt = serializeEvidencePrompt(base, spans.slice(0, low), witnessIds);
-  if (Buffer.byteLength(prompt) > MAX_EVIDENCE_PROMPT_BYTES) throw new ContentError('Evidence prompt exceeds the 12 KiB limit.');
+  let prompt = serializeEvidencePrompt(evidence, controlMetrics, chaosMetrics, faultWitnesses, supportingSpans.slice(0, low));
+  for (let witnessLimit = faultWitnesses.length; Buffer.byteLength(prompt) > MAX_EVIDENCE_PROMPT_BYTES && witnessLimit > 0; witnessLimit -= 1) {
+    prompt = serializeEvidencePrompt(evidence, controlMetrics, chaosMetrics, faultWitnesses.slice(0, witnessLimit - 1), []);
+  }
+  for (let metricLimit = Math.max(controlMetrics.length, chaosMetrics.length); Buffer.byteLength(prompt) > MAX_EVIDENCE_PROMPT_BYTES && metricLimit > 0; metricLimit -= 1) {
+    prompt = serializeEvidencePrompt(evidence, controlMetrics.slice(0, metricLimit - 1), chaosMetrics.slice(0, metricLimit - 1), [], []);
+  }
   return prompt;
+}
+
+function selectPromptMetrics(metrics: ValidatedEvidenceInput['chaos']['metrics'], peerMetrics: ValidatedEvidenceInput['chaos']['metrics']) {
+  const peerByKey = new Map(peerMetrics.map((metric) => [`${metric.serviceId}:${metric.channel}`, metric]));
+  const changedOrPrimary = metrics.filter((metric) => {
+    const peer = peerByKey.get(`${metric.serviceId}:${metric.channel}`);
+    const changed = !peer || peer.status !== metric.status || peer.errorsTotal !== metric.errorsTotal || peer.latencyP95Ms !== metric.latencyP95Ms;
+    return changed || metric.channel === PRIMARY_CHANNEL_BY_SERVICE[metric.serviceId];
+  });
+  return (changedOrPrimary.length ? changedOrPrimary : metrics).map(compactMetric);
+}
+
+function compactMetric(metric: ValidatedEvidenceInput['chaos']['metrics'][number]) {
+  return {
+    id: metric.id, serviceId: metric.serviceId, channel: metric.channel, status: metric.status,
+    requestsCompleted: metric.requestsCompleted, errorsTotal: metric.errorsTotal, timeoutsTotal: metric.timeoutsTotal,
+    errorRate: metric.errorRate, latencyP95Ms: metric.latencyP95Ms, sampleCount: metric.sampleCount,
+    ...(metric.activeSlotsPeak === undefined ? {} : { activeSlotsPeak: metric.activeSlotsPeak }),
+    ...(metric.longestSaturatedIntervalMs === undefined ? {} : { longestSaturatedIntervalMs: metric.longestSaturatedIntervalMs }),
+    ...(metric.queueLengthPeak === undefined ? {} : { queueLengthPeak: metric.queueLengthPeak }),
+    ...(metric.requestsQueued === undefined ? {} : { requestsQueued: metric.requestsQueued }),
+    ...(metric.queueRejected === undefined ? {} : { queueRejected: metric.queueRejected })
+  };
 }
 
 function compactSpan({ id, traceId, serviceId, channel, durationMs, faultApplied }: ValidatedEvidenceInput['chaos']['spans'][number]) {
   return { id, traceId, serviceId, channel, durationMs, faultApplied };
 }
 
-function serializeEvidencePrompt(base: { evidence: { supportingSpans: ReturnType<typeof compactSpan>[] }; measurementIds: { spanIds: string[] } }, spans: ReturnType<typeof compactSpan>[], witnessIds: string[]): string {
-  const spanIds = [...new Set([...witnessIds, ...spans.map((span) => span.id)])];
-  return JSON.stringify({ ...base, evidence: { ...base.evidence, supportingSpans: spans }, measurementIds: { ...base.measurementIds, spanIds } });
+function serializeEvidencePrompt(
+  evidence: ValidatedEvidenceInput,
+  controlMetrics: ReturnType<typeof compactMetric>[],
+  chaosMetrics: ReturnType<typeof compactMetric>[],
+  faultWitnesses: ReturnType<typeof compactSpan>[],
+  supportingSpans: ReturnType<typeof compactSpan>[]
+): string {
+  const metricIds = [...new Set([...controlMetrics.map((metric) => metric.id), ...chaosMetrics.map((metric) => metric.id)])];
+  const spanIds = [...new Set([...faultWitnesses.map((witness) => witness.id), ...supportingSpans.map((span) => span.id)])];
+  return JSON.stringify({
+    task: 'Explain supplied measured evidence only as JSON.',
+    instructions: ['Do not overwrite calculated counts, percentiles, or statuses.', 'Every hypothesis needs one allowed metricId.', 'Use only allowed metricIds and spanIds.'],
+    evidence: {
+      changedMetrics: { control: controlMetrics, chaos: chaosMetrics },
+      clientSummary: { control: evidence.control.clientSummary, chaos: evidence.chaos.clientSummary },
+      comparisonReasons: evidence.comparison.comparisonReasons ?? [],
+      faultWitnesses,
+      actualBlastRadiusIds: evidence.comparison.actualBlastRadiusIds,
+      supportingSpans
+    },
+    measurementIds: { metricIds, spanIds },
+    outputSchema: { summary: 'string', hypotheses: [{ explanation: 'string', metricIds: ['allowed metric ID'], spanIds: ['allowed span ID'] }], remediation: [{ proposal: 'string', limitation: 'string', metricIds: ['allowed metric ID'] }] }
+  });
 }
 
 function evidenceIdsFromPrompt(prompt: string): EvidenceIds {
@@ -293,7 +333,7 @@ function validateAnalysis(value: unknown, allowed: EvidenceIds) {
 function validateDiagnosticAction(value: unknown, allowed: EvidenceIds): DiagnosticAction {
   const action = DiagnosticActionSchema.parse(removePrivateReasoning(value));
   if (action.action === 'finish') {
-    verifyIds(action.metricIds, allowed.metricIds, 'metricIds');
+    verifyIds(action.metricIds, allowed.metricIds, 'metricIds', true);
     verifyIds(action.spanIds, allowed.spanIds, 'spanIds');
   }
   return action;
@@ -329,9 +369,9 @@ function removePrivateReasoning(value: unknown): unknown {
 }
 function truncateJson(value: unknown, bytes: number): unknown { const json = JSON.stringify(value); return Buffer.byteLength(json) <= bytes ? value : { truncated: true, preview: Buffer.from(json).subarray(0, bytes).toString('utf8') }; }
 function isObject(value: unknown): value is JsonObject { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-function isTransient(error: unknown): boolean { return error instanceof HttpError ? error.status === 429 || error.status >= 500 : error instanceof TypeError || (error instanceof Error && error.name === 'AbortError'); }
+function isTransient(error: unknown): boolean { return error instanceof HttpError ? error.status === 429 || error.status >= 500 : error instanceof TimeoutError || error instanceof TypeError || (error instanceof Error && error.name === 'AbortError'); }
 
-function normalizeControl(control: RequestControl | undefined, now: () => number): RequestControl | undefined {
+function normalizeControl(control: RequestControl | undefined, _now: () => number): RequestControl | undefined {
   if (!control) return undefined;
   if (control.deadlineMs !== undefined && !Number.isFinite(control.deadlineMs)) throw new TimeoutError('Nosana deadline must be an absolute epoch timestamp.');
   return { ...control };
@@ -349,10 +389,13 @@ function requestSignal(control: RequestControl | undefined, now: () => number): 
   assertBeforeDeadline(control?.deadlineMs, now);
   const controller = new AbortController();
   const remaining = control?.deadlineMs === undefined ? REQUEST_TIMEOUT_MS : Math.min(REQUEST_TIMEOUT_MS, control.deadlineMs - now());
-  const timeout = setTimeout(() => controller.abort(), remaining);
-  const abort = () => controller.abort();
+  const timeout = setTimeout(() => {
+    const expired = isDeadlineExpired(control?.deadlineMs, now);
+    controller.abort(new TimeoutError(expired ? 'Nosana request deadline elapsed.' : 'Nosana per-request timeout elapsed.'));
+  }, remaining);
+  const abort = () => controller.abort(control?.signal?.reason);
   control?.signal?.addEventListener('abort', abort, { once: true });
-  if (control?.signal?.aborted) controller.abort();
+  if (control?.signal?.aborted) controller.abort(control.signal.reason);
   return { signal: controller.signal, dispose: () => { clearTimeout(timeout); control?.signal?.removeEventListener('abort', abort); } };
 }
 

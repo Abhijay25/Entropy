@@ -12,9 +12,9 @@ const validHypothesis = JSON.stringify({
 const metric = (id: string) => ({ id, serviceId: 'payment-service', channel: 'business', status: 'DEGRADED', requestsStarted: 100, requestsCompleted: 100, errorsTotal: 10, timeoutsTotal: 5, errorRate: .1, latencyP50Ms: 10, latencyP95Ms: 3200, latencyP99Ms: 3200, sampleCount: 100, smallSample: false });
 const span = (id: string, faultApplied = false) => ({ id, kind: 'server', traceId: `trace-${id}`, serviceId: 'payment-service', channel: 'business', startedAt: '2026-01-01T00:00:00.000Z', durationMs: 20, faultApplied });
 const evidence = {
-  control: { metrics: [metric('metric-control')], spans: [span('span-control')] },
-  chaos: { metrics: [metric('metric-chaos')], spans: [span('span-chaos', true)] },
-  comparison: { actualBlastRadiusIds: ['payment-service'] },
+  control: { metrics: [metric('metric-control')], spans: [span('span-control')], clientSummary: { scheduled: 130, started: 130, completed: 130, skipped: 0, errors: 0, checkoutStarted: 100, checkoutCompleted: 100, checkoutErrors: 0, checkoutErrorRate: 0, checkoutP95Ms: 10 } },
+  chaos: { metrics: [metric('metric-chaos')], spans: [span('span-chaos', true)], clientSummary: { scheduled: 130, started: 130, completed: 130, skipped: 0, errors: 30, checkoutStarted: 100, checkoutCompleted: 100, checkoutErrors: 30, checkoutErrorRate: .3, checkoutP95Ms: 3200 } },
+  comparison: { actualBlastRadiusIds: ['payment-service'], comparisonReasons: [] },
   metricIds: ['metric-control', 'metric-chaos'], spanIds: ['span-control', 'span-chaos']
 } as unknown as ValidatedEvidenceInput;
 const context = {
@@ -60,14 +60,19 @@ describe('NosanaClient', () => {
     expect(service.checkHealth().status).toBe('unavailable');
   });
 
-  it('retries one 5xx request exactly once', async () => {
+  it('retries a 5xx request at most once across initial and failing retry calls', async () => {
     const prompts: string[] = [];
     const result = await client([completion('temporary', 503), completion(validHypothesis)], prompts).hypothesize(context);
     expect(prompts).toHaveLength(2);
     expect(result.source).toBe('nosana');
+
+    const failedPrompts: string[] = [];
+    const fallback = await client([completion('temporary', 503), completion('still down', 503), completion(validHypothesis)], failedPrompts).hypothesize(context);
+    expect(failedPrompts).toHaveLength(2);
+    expect(fallback.source).toBe('catalogue_fallback');
   });
 
-  it('repairs malformed output with original prompt, validation error, and no think content', async () => {
+  it('repairs malformed output once with original prompt, validation error, and no think content', async () => {
     const prompts: string[] = [];
     const result = await client([completion('<think>secret without close {bad'), completion(validHypothesis)], prompts).hypothesize(context);
     const repair = JSON.parse(prompts[1] ?? '{}') as Record<string, string>;
@@ -76,6 +81,11 @@ describe('NosanaClient', () => {
     expect(repair.originalPrompt).toContain('retrievedPaths');
     expect(repair.validationError).toContain('Invalid Nosana JSON');
     expect(repair.sanitizedResponse).not.toMatch(/think|secret/i);
+
+    const unrecoverablePrompts: string[] = [];
+    const unrecoverable = await client([completion('{bad'), completion('{still bad'), completion(validHypothesis)], unrecoverablePrompts).hypothesize(context);
+    expect(unrecoverablePrompts).toHaveLength(2);
+    expect(unrecoverable.source).toBe('catalogue_fallback');
   });
 
   it.each([
@@ -90,10 +100,12 @@ describe('NosanaClient', () => {
     expect(result.source).toBe('nosana');
   });
 
-  it('returns the exact shared EvidenceAnalysis shape with inference metadata', async () => {
+  it('returns the exact shared EvidenceAnalysis shape and catches prompt construction errors as unavailable', async () => {
     const result = await client([completion(analysis())]).analyze(evidence);
     expect(result).toMatchObject({ id: 'generated-id', status: 'available', source: 'nosana', model: 'model-1', promptVersion: 'nosana-v1' });
     expect(result.hypotheses).toHaveLength(1);
+    const malformedEvidence = {} as unknown as ValidatedEvidenceInput;
+    await expect(client([completion(analysis())]).analyze(malformedEvidence)).resolves.toMatchObject({ status: 'unavailable', source: 'deterministic' });
   });
 
   it('rejects span IDs used as metric IDs and empty hypothesis metric IDs', async () => {
@@ -103,12 +115,15 @@ describe('NosanaClient', () => {
     expect(emptyMetrics.status).toBe('unavailable');
   });
 
-  it('rejects invented finish metric and span IDs', async () => {
+  it('rejects invented or empty finish metric and span IDs', async () => {
+    const diagnostic = { runId: 'run-1', diagnosticId: 'diagnostic-1', allowedServiceIds: ['payment-service'], evidence } as DiagnosticPromptContext;
     const invented = JSON.stringify({ action: 'finish', summary: 'Evidence read.', metricIds: ['invented-metric'], spanIds: ['invented-span'] });
-    await expect(client([completion(invented), completion(invented)]).nextDiagnosticAction({ runId: 'run-1', diagnosticId: 'diagnostic-1', allowedServiceIds: ['payment-service'], evidence } as DiagnosticPromptContext)).rejects.toThrow();
+    const emptyMetricIds = JSON.stringify({ action: 'finish', summary: 'Evidence read.', metricIds: [], spanIds: ['span-chaos'] });
+    await expect(client([completion(invented), completion(invented)]).nextDiagnosticAction(diagnostic)).rejects.toThrow();
+    await expect(client([completion(emptyMetricIds), completion(emptyMetricIds)]).nextDiagnosticAction(diagnostic)).rejects.toThrow(/metricIds/);
   });
 
-  it('uses a single absolute deadline and never retries after it expires', async () => {
+  it('uses a single absolute deadline, aborts hung requests when deadlineMs expires, and never retries', async () => {
     let now = 100;
     let calls = 0;
     const service = new NosanaClient({
@@ -119,6 +134,31 @@ describe('NosanaClient', () => {
     expect(calls).toBe(1);
     await expect(service.hypothesize(context, { deadlineMs: 100 })).rejects.toThrow(/deadline/i);
     expect(calls).toBe(1);
+
+    let hungCalls = 0;
+    let hungClock = 1_000;
+    const hungService = new NosanaClient({
+      baseUrl: 'https://nosana.example', apiKey: 'key', model: 'model',
+      now: () => hungClock,
+      fetch: async (_url, init) => new Promise<Response>((_resolve, reject) => {
+        hungCalls += 1;
+        hungClock = 2_000;
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason ?? Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+      })
+    });
+    await expect(hungService.hypothesize(context, { deadlineMs: 1_050 })).rejects.toThrow(/deadline|aborted/i);
+    expect(hungCalls).toBe(1);
+
+    const requestTimeout = Object.assign(new Error('per-request timeout'), { name: 'AbortError' });
+    const hypothesisCalls: string[] = [];
+    const fallbackHypothesis = await client([requestTimeout, requestTimeout, completion(validHypothesis)], hypothesisCalls, { now: () => 100 }).hypothesize(context, { deadlineMs: 50_000 });
+    expect(hypothesisCalls).toHaveLength(2);
+    expect(fallbackHypothesis.source).toBe('catalogue_fallback');
+
+    const analysisCalls: string[] = [];
+    const fallbackAnalysis = await client([requestTimeout, requestTimeout, completion(analysis())], analysisCalls, { now: () => 100 }).analyze(evidence, { deadlineMs: 50_000 });
+    expect(analysisCalls).toHaveLength(2);
+    expect(fallbackAnalysis.status).toBe('unavailable');
   });
 
   it('honors AbortSignal cancellation without retrying', async () => {
@@ -136,27 +176,36 @@ describe('NosanaClient', () => {
     expect(calls).toBe(1);
   });
 
-  it('caps witnesses and spans under 12 KiB while allowing displayed witness citations', async () => {
+  it('caps 16 UUID metrics, 25 witnesses, and large span lists under 12 KiB without throwing', async () => {
+    const uuidMetrics = Array.from({ length: 16 }, (_, index) => ({
+      ...metric(`00000000-0000-4000-8000-${String(index).padStart(12, '0')}:payment-service:business`),
+      activeSlotsPeak: 4, longestSaturatedIntervalMs: 1200, queueLengthPeak: 4, requestsQueued: 20, queueRejected: 8
+    }));
     const oversized = {
       ...evidence,
-      chaos: { ...evidence.chaos, spans: Array.from({ length: 2000 }, (_, index) => span(`span-${index}`, index < 100)) }
+      control: { ...evidence.control, metrics: uuidMetrics.slice(0, 8) },
+      chaos: { ...evidence.chaos, metrics: uuidMetrics.slice(8, 16), spans: Array.from({ length: 2000 }, (_, index) => span(`00000000-0000-4000-9000-${String(index).padStart(12, '0')}`, index < 25)) },
+      comparison: { actualBlastRadiusIds: ['payment-service'], comparisonReasons: Array.from({ length: 10 }, (_, index) => `reason-${index}-${'x'.repeat(200)}`) }
     } as unknown as ValidatedEvidenceInput;
     const prompt = buildEvidencePrompt(oversized);
-    const parsed = JSON.parse(prompt) as { instructions: string[]; evidence: { faultWitnesses: Array<{ id: string }>; supportingSpans: unknown[] }; measurementIds: { spanIds: string[] } };
+    const parsed = JSON.parse(prompt) as { instructions: string[]; evidence: { clientSummary: unknown; comparisonReasons: string[]; faultWitnesses: Array<{ id: string }>; supportingSpans: unknown[] }; measurementIds: { metricIds: string[]; spanIds: string[] } };
     expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(12 * 1024);
     expect(parsed.instructions.length).toBeGreaterThan(0);
-    expect(parsed.evidence.faultWitnesses).toHaveLength(20);
-    expect(parsed.evidence.supportingSpans.length).toBeGreaterThan(0);
+    expect(parsed.evidence.clientSummary).toBeDefined();
+    expect(parsed.evidence.comparisonReasons).toHaveLength(10);
+    expect(parsed.evidence.faultWitnesses.length).toBeGreaterThan(0);
+    expect(parsed.evidence.faultWitnesses.length).toBeLessThanOrEqual(20);
     const witnessId = parsed.evidence.faultWitnesses[0]?.id ?? '';
+    const metricId = parsed.measurementIds.metricIds[0] ?? '';
     expect(parsed.measurementIds.spanIds).toContain(witnessId);
     const diagnostic = { runId: 'run-1', diagnosticId: 'diagnostic-1', allowedServiceIds: ['payment-service'], evidence: oversized } as DiagnosticPromptContext;
-    const action = JSON.stringify({ action: 'finish', summary: 'Witness read.', metricIds: ['metric-chaos'], spanIds: [witnessId] });
+    const action = JSON.stringify({ action: 'finish', summary: 'Witness read.', metricIds: [metricId], spanIds: [witnessId] });
     await expect(client([completion(action)]).nextDiagnosticAction(diagnostic)).resolves.toMatchObject({ action: 'finish', spanIds: [witnessId] });
   });
 
   it('keeps diagnostic prompts separate from analysis instructions and schemas', async () => {
     const prompts: string[] = [];
-    const diagnostic = { runId: 'run-1', diagnosticId: 'diagnostic-1', allowedServiceIds: ['payment-service'], evidence, toolTrace: [{ output: 'untrusted tool result' }] } as unknown as DiagnosticPromptContext;
+    const diagnostic = { runId: 'run-1', diagnosticId: 'diagnostic-1', allowedServiceIds: ['payment-service'], evidence, toolTrace: [{ id: 'trace-1', action: 'read_evidence', toolName: 'readFile', success: true, startedAt: '2026-01-01T00:00:00.000Z', finishedAt: '2026-01-01T00:00:01.000Z', elapsedMs: 1000, argumentSummary: '{}', resultSummary: 'untrusted tool result' }] } satisfies DiagnosticPromptContext;
     await client([completion(JSON.stringify({ action: 'finish', summary: 'Evidence read.', metricIds: ['metric-chaos'], spanIds: ['span-chaos'] }))], prompts).nextDiagnosticAction(diagnostic);
     const prompt = prompts[0] ?? '';
     expect(prompt).toContain('untrusted_data');

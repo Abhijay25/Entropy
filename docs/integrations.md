@@ -11,7 +11,9 @@ Entropy uses Neo4j as the topology and evidence store, Nosana for bounded infere
 
 ### Tested versions
 
-Record the exact versions used for the live run in handoff notes. The current checked workspace uses:
+Record the exact versions used for the live run in handoff notes.
+
+#### Verified in Lane B workspace
 
 | Component | Tested version |
 | --- | --- |
@@ -21,6 +23,17 @@ Record the exact versions used for the live run in handoff notes. The current ch
 | `zod` | 4.6.7 |
 | `@xyflow/react` | 12.12.0 |
 | `vitest` | 4.1.12 |
+
+#### Lane A / Live Provider Targets (pending Lane A scripts & live doctor check)
+
+| Component | Target / verification |
+| --- | --- |
+| `@daytona/sdk` | Pending: Lane A `npm run doctor` |
+| `@modelcontextprotocol/client` | Pending: Lane A `npm run doctor` |
+| Daytona CLI | Pending: Lane A `npm run doctor` |
+| Neo4j Community image | 5.26-community |
+
+Lane A owns the operational scripts (`doctor`, `db:migrate`, `payload:check`, `prepare:payload`, and `cleanup`) and executes the live provider smoke gate against those targets.
 
 Create a root `.env` locally. Do not commit it, pass it to browser code, put it in payload archives, prompts, artifacts, or terminal output. In particular, no sponsor secret may use a `VITE_*` variable.
 
@@ -72,17 +85,18 @@ SDK credentials do not prove Daytona CLI authentication. Store discovered MCP to
 
 ### Local Docker setup
 
-Aura users can skip this section. For a local database, bind only to loopback, use a named volume, and keep credentials in `.env`:
+Aura users can skip this section. For a local database, first set `NEO4J_URI=neo4j://127.0.0.1:7687`, `NEO4J_USERNAME=neo4j`, and `NEO4J_PASSWORD` in `.env`, then bind only to loopback and use a named volume:
 
 ```sh
+set -a; . ./.env; set +a
 docker run --name entropy-neo4j --rm \
   -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 \
   -v entropy-neo4j:/data \
   -e NEO4J_AUTH="neo4j/${NEO4J_PASSWORD}" \
-  neo4j:5-community
+  neo4j:5.26-community
 ```
 
-Then set `NEO4J_URI=neo4j://127.0.0.1:7687`, `NEO4J_USERNAME=neo4j`, and the matching `NEO4J_PASSWORD`, run `npm run db:migrate`, and verify `RETURN 1` in Neo4j Browser. Use the project `compose.yaml` when present instead of adding a second database definition.
+Then run `npm run db:migrate` and verify `RETURN 1` in Neo4j Browser. Use the project `compose.yaml` when present instead of adding a second database definition.
 
 ### Migration and persistence rules
 
@@ -130,16 +144,20 @@ LIMIT 10;
 
 The backend records this fixed query and parameters in the hypothesis inspector. It retrieves context only; it does not prove a single point of failure.
 
-A comparison must explicitly select the run and control/chaos trial IDs. The following inspection query retrieves persisted metrics and observed overlays without deriving state from predictions:
+A comparison must explicitly select the run and control/chaos trial IDs. Query metrics and observed overlays separately so optional overlays do not multiply metric rows:
 
 ```cypher
 MATCH (run:EntropyRun {id: $runId})-[:HAS_TRIAL]->(control:EntropyTrial {id: $controlTrialId})
 MATCH (run)-[:HAS_TRIAL]->(chaos:EntropyTrial {id: $chaosTrialId})
-OPTIONAL MATCH (control)-[:HAS_METRIC]->(controlMetric:EntropyMetric)-[:OF_SERVICE]->(service)
-OPTIONAL MATCH (chaos)-[:HAS_METRIC]->(chaosMetric:EntropyMetric)-[:OF_SERVICE]->(service)
-OPTIONAL MATCH (dependency)-[cascade:CASCADED_TO {trialId: $chaosTrialId}]->(affected)
-RETURN service.id, controlMetric, chaosMetric,
-       dependency.id, affected.id, cascade.supportingSpanIds;
+MATCH (control)-[:HAS_METRIC]->(controlMetric:EntropyMetric)-[:OF_SERVICE]->(service)
+MATCH (chaos)-[:HAS_METRIC]->(chaosMetric:EntropyMetric)-[:OF_SERVICE]->(service)
+WHERE chaosMetric.channel = controlMetric.channel
+RETURN service.id, controlMetric, chaosMetric;
+```
+
+```cypher
+MATCH (dependency)-[cascade:CASCADED_TO {trialId: $chaosTrialId}]->(affected)
+RETURN dependency.id, affected.id, cascade.supportingSpanIds;
 ```
 
 `saveTrial` commits trial state, metrics, artifact metadata, and source/workload hashes atomically. Deterministic metric IDs are `<trialId>:<serviceId>:<channel>` and writes use idempotent `MERGE`. Keep sessions short-lived and closed. Managed transaction callbacks may retry, so provider calls, file writes, and random ID allocation occur outside them.
@@ -181,7 +199,7 @@ Analysis prompts contain valid control/chaos summaries, backend-calculated affec
 
 Parse the complete response as JSON after removing at most one enclosing Markdown fence. One repair completion is allowed for invalid JSON/schema output. Each request has a 30-second timeout, bounded output tokens, and at most one transient network/5xx retry.
 
-- An unconfigured, unreachable, or invalid hypothesis response returns the explicitly labeled `catalogue_fallback` Redis-delay hypothesis.
+- An unconfigured, unreachable, or invalid hypothesis response returns the explicitly labeled `catalogue_fallback` Redis-delay hypothesis (`catalogue_fallback` does not satisfy live acceptance).
 - An unavailable or invalid analysis returns `status: "unavailable"`, `source: "deterministic"`, and preserves measured facts.
 - Invalid model output is never executable. No v1 remediation applies a patch or promises self-healing.
 

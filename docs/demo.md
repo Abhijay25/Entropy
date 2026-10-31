@@ -21,37 +21,36 @@ State the experiment boundary: the sole executable fault is a 3,000 ms Redis lat
 
 ### 0:20-0:45 - retrieve and predict
 
-Click **Run Experiment**. The Hypothesis card shows the retrieved Redis path. Open its collapsible **Inspect fixed Cypher query** control and show the server-owned query. The expected dependency direction for the prediction is Redis -> Auth -> Payment -> Order -> Frontend.
+Click **Run Experiment**. In `HypothesisCard`, point out the hypothesis `title`, `question`, target fault (`redis-cache` `LATENCY_SPIKE`, `3000 ms` for `10 s`), predicted path (`predictedBlastRadiusIds`: Redis -> Auth -> Payment -> Order -> Frontend), `rationale`, and provenance badge (`source: nosana` with model or `catalogue_fallback`). Open its collapsible Cypher query inspector (**Inspect fixed Cypher query**) to show the server-owned parameterized query.
 
-Call out the hypothesis source/model and exact allowed fault. Explain that the server attaches the ID and fixed Cypher; the model cannot submit Cypher, commands, alternate fault parameters, or observed results. If the card says `catalogue_fallback`, say so explicitly and do not describe it as live inference.
+Live acceptance requires a real Nosana hypothesis with `source: nosana`; if the provenance badge shows `catalogue_fallback`, say so explicitly and do not describe it as live inference.
 
 ### 0:45-1:35 - measure, do not infer
 
-Show the healthy baseline first. Then show control and chaos provisioning/running in parallel from the same immutable payload, workload, source revision, and runtime identity. In **Trial Comparison**, point out each trial ID, actual sandbox ID, stage, and cleanup state.
+Show the healthy baseline first. Then show control and chaos provisioning/running in parallel from the same immutable payload, workload, source revision, and runtime identity. In `TrialComparison`, point out each trial ID, `runtimeIdentity`, sandbox ID, lifecycle status, and cleanup status.
 
-When trials finish, compare:
+When trials finish, compare the rendered `TrialComparison` fields:
 
 - checkout error fraction and its completed-request denominator;
-- p95 including failed request durations and sample count;
+- p95 latency (including failed request durations), sample count `N`, and any `smallSample` (`N < 20`) warning;
 - channel-specific service status (business for services, canary for datastore mocks);
-- Payment active-slot, queue, and rejection/saturation measurements;
-- Redis business fault witnesses and supporting request spans.
+- Payment queue counters (`activeSlotsPeak`, `longestSaturatedIntervalMs`, `queueLengthPeak`, `requestsQueued`, `queueRejected`).
 
 Describe only measured facts. A bad control, generator cap limitation, missing witness, or insufficient samples is **inconclusive**, not zero impact and not a fabricated cascade.
 
 ### 1:35-2:05 - inspect the graph and explanation
 
-Select an affected node. In the **Evidence Drawer**, show control/chaos counts, raw latency data, queue evidence, artifacts, and linked span IDs. Explain the legend: configured edges point caller -> dependency; an observed `CASCADED_TO` overlay reverses that direction (degraded dependency -> affected caller) and exists only with supporting business-span evidence.
+Select an affected node on the graph. In `EvidenceDrawer`, inspect the per-node control/chaos metrics, request spans (`traceId`, `durationMs`, `faultApplied`), and bounded artifact viewer. Explain the graph legend: configured edges point caller -> dependency; an observed `CASCADED_TO` overlay reverses that direction (degraded dependency -> affected caller) and exists only with supporting business-span evidence.
 
-Show the Nosana evidence analysis separately from facts. Its hypotheses cite persisted metric/span IDs; remediation is proposed advice with limitations, not an apply-patch action. If analysis is unavailable, show the preserved metrics and the unavailable state instead of substituting prose.
+In the **Analysis** panel, show the `summary`, `model`/`source` provenance, clickable `metricId` and `spanId` evidence chips, and `remediation` proposals with their explicit `limitation` notes (advice only, never an apply-patch action). If analysis is unavailable, show the preserved metrics and the `status: unavailable` banner instead of substituting prose.
 
 ### 2:05-2:35 - reproduce
 
-Click **Reproduce** on the completed run. This makes a new matched control/fault pair and preserves the original evidence. In **Trial Comparison**, switch between original and reproduction pairs, show the new trial IDs and matching manifest identity, then state the classification (`reproduced`, `partial`, `not_reproduced`, or `inconclusive`). Do not overwrite or relabel the original result.
+Click **Reproduce** on the completed run. This makes a new matched control/fault pair and preserves the original evidence. In `TrialComparison`, switch between original and reproduction pairs, show the new trial IDs and matching `runtimeIdentity`/manifest hashes, then state the classification (`reproduced`, `partial`, `not_reproduced`, or `inconclusive`). Do not overwrite or relabel the original result. If the active workflow budget or time is tight, inspect the labeled reproduction pair from a completed rehearsal run instead; identify it as recorded evidence with its original run and trial IDs.
 
 ### 2:35-3:00 - diagnose and close
 
-Click **Investigate**. In the **Diagnostic Drawer**, show that it uses a distinct diagnostic sandbox, uploads sanitized evidence, and records the discovered Daytona MCP evidence-read tool, timing, and redacted result. The optional auth probe is not a statistical re-run.
+Click **Investigate**. In `DiagnosticDrawer`, show the MCP `toolTrace` entries (action `read_evidence` / `probe_auth` / `finish`, discovered Daytona MCP `toolName`, `elapsedMs`, redacted `argumentSummary` and `resultSummary`, and sandbox cleanup status). The optional auth probe is not a statistical re-run. If the diagnostic cannot start within the remaining workflow budget, inspect the labeled, completed rehearsal diagnostic trace instead and state that it is recorded evidence, not a live call.
 
 Close with the recorded cleanup result: “The original run, reproduction, diagnostic trace, evidence IDs, and sandbox cleanup state are persisted. The graph distinguishes the predicted path from the measured result.”
 
@@ -64,19 +63,26 @@ A real baseline plus matched Daytona trials can exceed the speaking clock becaus
 The dashboard supports this sequence:
 
 1. View the six-node dependency graph, source revision, and sponsor connection statuses.
-2. Use **Run Experiment** to generate the bounded hypothesis from Neo4j context.
-3. Use the Hypothesis card's collapsible Cypher inspector to view the predicted Redis -> Auth -> Payment -> Order -> Frontend path and source query.
-4. Follow baseline, then parallel matched control/chaos trials in **Trial Comparison**, including their trial IDs.
-5. Compare checkout errors, p95, service states, and Payment queue evidence.
-6. Open the **Evidence Drawer** for the observed affected graph, counts, traces, latency samples, and artifacts.
-7. Read the Nosana explanation while keeping facts, hypotheses, and remediation distinct.
-8. Reproduce with a fresh pair or investigate through the **Diagnostic Drawer** and Daytona MCP.
-9. Inspect sandbox IDs, cleanup state, sample counts, and recorded/live provenance after refresh.
-10. Use **Load Labeled Dev Fixture** only to demonstrate the explicitly labeled fixture state, never to hide a live API failure.
+2. Use **Run Experiment** to generate the bounded hypothesis in `HypothesisCard` (title, question, target fault, predicted path, rationale, provenance badge, and collapsible Cypher query inspector).
+3. Follow baseline, then parallel matched control/chaos trials in `TrialComparison` (trial IDs, `runtimeIdentity`, checkout error fraction, p95, sample count `N`, small-sample warning, and Payment queue counters).
+4. Open `EvidenceDrawer` for per-node metrics, spans, and the bounded artifact viewer.
+5. Read the **Analysis** panel (`summary`, `model`/`source`, clickable `metricId`/`spanId` chips, and `remediation` proposals with limitations) while keeping facts, hypotheses, and remediation distinct.
+6. Reproduce with a fresh pair in `TrialComparison` or investigate through `DiagnosticDrawer` (MCP `toolTrace`).
+7. Inspect sandbox IDs, cleanup state, sample counts, and recorded/live provenance after refresh.
+8. Use **Load Labeled Dev Fixture** only to demonstrate the explicitly labeled fixture state, never to hide a live API failure.
 
 ## Neo4j Browser verification
 
-Substitute the real IDs shown by the run. Queries are inspection only; do not paste model output into Neo4j Browser.
+Substitute the real IDs shown by the run. Queries are inspection only; do not paste model output into Neo4j Browser. Set Browser parameters first, using the selected run and trial IDs:
+
+```cypher
+:param runId => 'run-0001';
+:param controlTrialId => 'trial-control-0001';
+:param chaosTrialId => 'trial-chaos-0001';
+:param redisKey => 'entropy:run-0001:redis-cache';
+:param projectId => 'entropy';
+:param scope => 'run-0001';
+```
 
 ### Find the selected run and its trials
 
@@ -117,7 +123,8 @@ MATCH (run:EntropyRun {id: $runId})-[:HAS_TRIAL]->(control:EntropyTrial {id: $co
 MATCH (run)-[:HAS_TRIAL]->(chaos:EntropyTrial {id: $chaosTrialId})
 MATCH (control)-[:HAS_METRIC]->(controlMetric:EntropyMetric)-[:OF_SERVICE]->(service)
 MATCH (chaos)-[:HAS_METRIC]->(chaosMetric:EntropyMetric)-[:OF_SERVICE]->(service)
-RETURN service.id, controlMetric.channel, controlMetric.status,
+WHERE chaosMetric.channel = controlMetric.channel
+RETURN service.id, controlMetric.channel, chaosMetric.channel AS channel, controlMetric.status,
        controlMetric.requestsCompleted, controlMetric.errorsTotal,
        controlMetric.latencyP95Ms, chaosMetric.status,
        chaosMetric.requestsCompleted, chaosMetric.errorsTotal,
@@ -172,4 +179,4 @@ A valid live diagnostic includes an actual MCP evidence-read call, final evidenc
 
 ## Final acceptance checklist
 
-Before calling the presentation live, confirm all Section 14 checks: real provider `doctor` checks; local healthy/load/fault behavior; unknown-token 401 auth failure; immutable payload identity; baseline followed by overlapping control/chaos; Redis business witness; graph states backed by persisted metrics; failure durations included in latency; validated Nosana evidence links and a truthful provider-error unavailable state; a new reproduction pair; a real MCP evidence-read trace; cancel and restart recovery; and no orphaned Entropy sandboxes.
+Before calling the presentation live, confirm all Section 14 checks: real provider `doctor` checks; a real Nosana hypothesis with `source: nosana` rather than `catalogue_fallback`; local healthy/load/fault behavior; unknown-token 401 auth failure; immutable payload identity; baseline followed by overlapping control/chaos; Redis business witness; Payment active-slot and queue counters inspected before claiming saturation; graph states backed by persisted metrics with one path inspected directly in Neo4j; failure durations, sample sizes, and traffic channels displayed; validated Nosana evidence links and a truthful provider-error unavailable state; a reproduction pair with an identical manifest; a real MCP evidence-read trace from a separate diagnostic sandbox; cancel and restart recovery; and no orphaned Entropy sandboxes.

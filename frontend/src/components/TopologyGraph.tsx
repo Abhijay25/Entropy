@@ -13,7 +13,7 @@ interface Props { graph?: Topology; predictedIds: readonly string[]; selectedNod
 function graphNode(node: ServiceNode, selectedNodeId?: string): Node {
   return { id: node.id, position: POSITIONS[node.id] ?? { x: 0, y: 0 }, data: { label: <><strong>{node.name}</strong><small>{node.mock ? 'mock datastore' : `:${node.port}`} - {node.status}</small></> }, className: `topology-node status-${node.status.toLowerCase()}${selectedNodeId === node.id ? ' is-selected' : ''}` };
 }
-function flowEdge(edge: DependencyEdge): Edge {
+export function flowEdge(edge: DependencyEdge): Edge {
   const style = edgeStyle(edge);
   const styles: Record<EdgeStyle, Edge> = {
     configured: { id: edge.id, source: edge.source, target: edge.target, label: edge.relationship, className: 'topology-edge configured-edge', style: { stroke: '#75808d' } },
@@ -22,7 +22,7 @@ function flowEdge(edge: DependencyEdge): Edge {
   };
   return styles[style];
 }
-function predictedEdges(graph: Topology, predictedIds: readonly string[]): Edge[] {
+export function predictedEdges(graph: Topology, predictedIds: readonly string[]): Edge[] {
   return predictedIds.slice(1).flatMap((serviceId, index) => {
     const previous = predictedIds[index];
     if (!previous) return [];
