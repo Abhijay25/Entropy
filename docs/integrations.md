@@ -28,8 +28,9 @@ Record the exact versions used for the live run in handoff notes.
 
 | Component | Version / verification |
 | --- | --- |
-| `@daytona/sdk` | 0.227.0 (types checked; live SDK calls not yet run) |
-| `@modelcontextprotocol/client` | 2.4.0 (types checked; Daytona CLI not yet installed) |
+| `@daytona/sdk` | 0.227.0 — verified live 2026-10-31 (region `eu`): doctor smoke, matched parallel pairs, reproduction, mid-run cancel, crash recovery; deletion waits for confirmed destruction |
+| `@modelcontextprotocol/client` | 2.4.0 — `daytona mcp start` verified by doctor (39 tools; `file_download` read the smoke file). Full Nosana-driven diagnostic not yet run (Nosana unconfigured) |
+| Daytona CLI | v0.227.0 (`daytona/clients` release; authenticate with `daytona login --api-key`) |
 | `esbuild` (payload bundler) | 0.28.2 |
 | `tsx` | 4.23.15 |
 | Neo4j image (`compose.yaml`) | `neo4j:5.26.16-community` (migration, persistence, and restart recovery verified locally) |
@@ -230,6 +231,9 @@ Use at most two MCP calls, three model turns including final explanation, and th
 - Trial records are written to `.entropy/recovery/` before each Neo4j write and removed after it succeeds; a failed write halts new scheduling (503) and is replayed idempotently on restart.
 - On startup the backend marks unfinished runs and trials `INTERRUPTED` (never resumed), deletes their recorded sandboxes, sweeps Entropy-labeled sandboxes belonging to known runs, and keeps capacity reserved for any sandbox it fails to delete.
 - `npm run doctor` writes redacted results to `.entropy/doctor.json` (read by `GET /api/integrations`) and the discovered MCP mapping to `.entropy/mcp-tools.json`. The MCP mapping is derived from `listTools` schemas (a file-read tool and its sandbox/path arguments); the diagnostic refuses to run without it.
+- Every sandbox is labeled `owner=<user>-<host>`; on startup the backend deletes its own leftover sandboxes even if the run record was lost (in-memory store), without touching another teammate's.
+- The comparator fails closed: missing/unsampled/duplicate metrics, status labels that contradict counters, metrics that disagree with retained server spans, unfinished handlers, missing evidence artifacts, or a Redis witness without an unbroken parent chain to a Frontend request make the comparison inconclusive (never a smaller or larger radius). The backend also cross-checks `spans.jsonl` and the controller's `fault-witness.json` against `trial.json`.
+- Live mode refuses a development (working-tree) payload.
 - The optional `probe_auth` diagnostic action is not enabled in this build; the model may request it, but it is recorded as not executed.
 
 ## Script ownership, health, and cleanup checks
