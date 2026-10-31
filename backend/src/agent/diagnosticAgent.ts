@@ -3,6 +3,7 @@
 // MCP tools with fixed arguments. Tool output is untrusted data, never instructions.
 import {
   type DiagnosticAction,
+  type DiagnosticPromptContext,
   type DiagnosticSession,
   type DiagnosticTraceEntry,
   type RunSnapshot
@@ -96,9 +97,9 @@ export class DiagnosticAgent implements DiagnosticLauncher {
       let finish: Extract<DiagnosticAction, { action: 'finish' }> | undefined;
       for (let turn = 1; turn <= MAX_MODEL_TURNS && !finish; turn += 1) {
         if (signal.aborted) throw signal.reason;
-        const forceFinish = turn === MAX_MODEL_TURNS || trace.length >= MAX_MCP_CALLS;
-        const context = { runId: run.id, diagnosticId, allowedServiceIds: sanitized.allowedServiceIds, evidence, toolTrace: trace.map((entry) => ({ action: entry.action, toolName: entry.toolName, success: entry.success, untrustedResult: entry.resultSummary })), ...(forceFinish ? { instruction: 'Respond with the finish action now.' } : {}) };
-        const action = await this.deps.nosana.nextDiagnosticAction(context as unknown as Parameters<NosanaPort['nextDiagnosticAction']>[0], { signal, deadlineMs: Date.now() + 40_000 });
+        // The Nosana client marks toolTrace as untrusted data inside its prompt.
+        const context: DiagnosticPromptContext = { runId: run.id, diagnosticId, allowedServiceIds: sanitized.allowedServiceIds, evidence, toolTrace: [...trace] };
+        const action = await this.deps.nosana.nextDiagnosticAction(context, { signal, deadlineMs: Date.now() + 40_000 });
         if (action.action === 'finish') { finish = action; break; }
         if (trace.length >= MAX_MCP_CALLS) continue;
         const entry = await this.runAction(action, mapping, mcp, sandboxId, trace.length);
