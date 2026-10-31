@@ -1,21 +1,23 @@
 # Local Neo4j Community for development and the live demo. Aura users skip this file.
-# Credentials come from the root .env (NEO4J_PASSWORD); ports bind to loopback only.
+# Credentials come from the root .env; ports bind to loopback only.
+#   docker compose up -d --wait
 services:
   neo4j:
     image: neo4j:5.26.16-community
-    environment:
-      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env}
-      NEO4J_server_memory_heap_max__size: 1G
+    container_name: entropy-neo4j
     ports:
-      - "127.0.0.1:7474:7474"
-      - "127.0.0.1:7687:7687"
+      - '127.0.0.1:7474:7474'
+      - '127.0.0.1:7687:7687'
+    environment:
+      NEO4J_AUTH: '${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}'
+      NEO4J_server_memory_heap_max__size: 1G
     volumes:
-      - entropy-neo4j-data:/data
+      - entropy-neo4j:/data
     healthcheck:
-      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"$${NEO4J_AUTH#neo4j/}\" 'RETURN 1' >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "cypher-shell -u \"$${NEO4J_AUTH%%/*}\" -p \"$${NEO4J_AUTH#*/}\" 'RETURN 1' >/dev/null 2>&1"]
       interval: 5s
       timeout: 5s
       retries: 24
 
 volumes:
-  entropy-neo4j-data:
+  entropy-neo4j:

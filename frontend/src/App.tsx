@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DEV_FIXTURE_BANNER, DEV_FIXTURE_DIAGNOSTIC_SESSION, DEV_FIXTURE_RUN_SNAPSHOT } from '@entropy/shared';
 import type { DiagnosticSession, RunSnapshot, TopologyGraph } from '@entropy/shared';
 import { api, listFrom, normalizeIntegrations, type IntegrationStatus, type RunSummary } from './api';
@@ -9,75 +9,76 @@ import { TerminalFeed } from './components/TerminalFeed';
 import { TopologyGraph as TopologyGraphView } from './components/TopologyGraph';
 import { TrialComparison } from './components/TrialComparison';
 
-const TERMINAL_RUN_STATUSES = new Set(['COMPLETED', 'BASELINE_FAILED', 'INCONCLUSIVE', 'FAILED', 'CANCELLED', 'INTERRUPTED']);
-const TERMINAL_DIAGNOSTIC_STATUSES = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED']);
-export const isSmallCheckoutSample = (sampleCount: number) => sampleCount < 20;
+const TERMINAL_RUN = new Set(['COMPLETED', 'BASELINE_FAILED', 'INCONCLUSIVE', 'FAILED', 'CANCELLED', 'INTERRUPTED']);
+const TERMINAL_FAILURE = new Set(['FAILED', 'CANCELLED', 'INTERRUPTED']);
+const ACTIVE_TRIAL = new Set(['QUEUED', 'PROVISIONING', 'PREPARING', 'RUNNING', 'COLLECTING']);
+const TERMINAL_DIAGNOSTIC = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'INTERRUPTED']);
+const DEVELOPMENT_LOCAL_BANNER = 'DEVELOPMENT LOCAL EXECUTION MODE - not live provider evidence.';
+export const REPRODUCTION_WAIT_TIMEOUT_MS = 90_000;
 export const liveStateAfterFixture = () => ({ snapshot: undefined, graph: undefined, diagnostic: undefined });
-function updateUrl(runId?: string) { const url = new URL(window.location.href); if (runId) url.searchParams.set('runId', runId); else url.searchParams.delete('runId'); window.history.replaceState({}, '', url); }
-function operationKey() { return crypto.randomUUID(); }
-
-function AnalysisPanel({ snapshot }: { snapshot?: RunSnapshot }) {
-  const analysis = snapshot?.analysis;
-  return <section className="panel analysis-panel"><p className="eyebrow">Nosana evidence analysis</p><h2>Measured facts, hypotheses, and limitations</h2>{!analysis ? <p className="muted">Not generated yet.</p> : analysis.status === 'unavailable' ? <p className="muted">Analysis unavailable. Telemetry remains authoritative.</p> : <><p>{analysis.summary}</p><p className="muted">{analysis.source}{analysis.model ? ` - ${analysis.model}` : ''} - prompt {analysis.promptVersion} - {analysis.createdAt}</p><h3>Qualified hypotheses</h3>{analysis.hypotheses.map((item) => <article key={item.explanation}><p>{item.explanation}</p><div className="chip-list">{item.metricIds.map((id) => <button className="chip" title={`Metric ${id}`} key={id}>{id}</button>)}{item.spanIds.map((id) => <button className="chip" title={`Span ${id}`} key={id}>{id}</button>)}</div></article>)}<h3>Proposed remediation</h3>{analysis.remediation.map((item) => <article key={item.proposal}><p>{item.proposal}</p><p className="muted">Limitation: {item.limitation}</p><div className="chip-list">{item.metricIds.map((id) => <button className="chip" title={`Metric ${id}`} key={id}>{id}</button>)}</div></article>)}</>}</section>;
+export function hasReproductionWaitExpired(startedAtMs: number | undefined, nowMs: number, expectedTrialIds: readonly string[], snapshot?: RunSnapshot): boolean {
+  if (startedAtMs === undefined || nowMs - startedAtMs < REPRODUCTION_WAIT_TIMEOUT_MS) return false;
+  const seen = expectedTrialIds.length ? expectedTrialIds.some((id) => snapshot?.trials.some((trial) => trial.id === id)) : snapshot?.trials.some((trial) => trial.kind.startsWith('reproduction-'));
+  return !seen;
 }
+export const hasReproduction = (snapshot?: RunSnapshot) => Boolean(snapshot?.reproduction || snapshot?.trials.some((trial) => trial.kind.startsWith('reproduction-')));
+export function isReproductionSettled(snapshot?: RunSnapshot): boolean {
+  if (!snapshot) return false;
+  if (snapshot.reproduction) return true;
+  const trials = snapshot.trials.filter((trial) => trial.kind.startsWith('reproduction-'));
+  return trials.some((trial) => TERMINAL_FAILURE.has(trial.status)) && !trials.some((trial) => ACTIVE_TRIAL.has(trial.status));
+}
+export function isReproductionBusy(reproductionClicked: boolean, snapshot?: RunSnapshot): boolean {
+  if (isReproductionSettled(snapshot)) return false;
+  return reproductionClicked || Boolean(snapshot?.trials.some((trial) => trial.kind.startsWith('reproduction-')));
+}
+export const clearDiagnosticForRunSwitch = (currentRunId: string | undefined, nextRunId: string) => currentRunId !== nextRunId ? undefined : 'preserve';
+export function createTrailingRefreshScheduler(refresh: () => Promise<void>, delayMs = 700) {
+  let lastRun = 0; let timer: ReturnType<typeof setTimeout> | undefined;
+  const run = () => { timer = undefined; lastRun = Date.now(); void refresh(); };
+  return { schedule: () => { const remaining = delayMs - (Date.now() - lastRun); if (remaining <= 0) run(); else { if (timer) clearTimeout(timer); timer = setTimeout(run, remaining); } }, dispose: () => { if (timer) clearTimeout(timer); } };
+}
+function setRunUrl(runId?: string) { const url = new URL(window.location.href); if (runId) url.searchParams.set('runId', runId); else url.searchParams.delete('runId'); window.history.replaceState({}, '', url); }
+function setDiagnosticUrl(diagnosticId?: string) { const url = new URL(window.location.href); if (diagnosticId) url.searchParams.set('diagnosticId', diagnosticId); else url.searchParams.delete('diagnosticId'); window.history.replaceState({}, '', url); }
+function operationKey() { return crypto.randomUUID(); }
+function serviceForEvidence(snapshot: RunSnapshot | undefined, evidenceId: string): string | undefined { for (const trial of snapshot?.trials ?? []) { const metric = trial.metrics.find((item) => item.id === evidenceId); if (metric) return metric.serviceId; const span = trial.spans.find((item) => item.id === evidenceId); if (span) return span.serviceId; } return undefined; }
+function AnalysisPanel({ snapshot, onSelectEvidence }: { snapshot?: RunSnapshot; onSelectEvidence: (id: string) => void }) { const analysis = snapshot?.analysis; const chip = (id: string) => <button className="chip" onClick={() => onSelectEvidence(id)} key={id}>{id}</button>; return <section className="panel analysis-panel"><p className="eyebrow">Nosana evidence analysis</p><h2>Measured facts, hypotheses, and limitations</h2>{!analysis ? <p className="muted">Not generated yet.</p> : analysis.status === 'unavailable' ? <p className="muted">Analysis unavailable. Telemetry remains authoritative.</p> : <><p>{analysis.summary}</p><p className="muted">{analysis.source}{analysis.model ? ` - ${analysis.model}` : ''} - prompt {analysis.promptVersion} - {analysis.createdAt}</p><h3>Qualified hypotheses</h3>{analysis.hypotheses.map((item) => <article key={item.explanation}><p>{item.explanation}</p><div className="chip-list">{item.metricIds.map(chip)}{item.spanIds.map(chip)}</div></article>)}<h3>Proposed remediation</h3>{analysis.remediation.map((item) => <article key={item.proposal}><p>{item.proposal}</p><p className="muted">Limitation: {item.limitation}</p><div className="chip-list">{item.metricIds.map(chip)}</div></article>)}</>}</section>; }
 
 export default function App() {
-  const [snapshot, setSnapshot] = useState<RunSnapshot>();
-  const [graph, setGraph] = useState<TopologyGraph>();
-  const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [integrations, setIntegrations] = useState<IntegrationStatus[]>([]);
-  const [selectedNodeId, setSelectedNodeId] = useState<string>();
-  const [pair, setPair] = useState<'original' | 'reproduction'>('original');
-  const [diagnostic, setDiagnostic] = useState<DiagnosticSession>();
-  const [fixtureMode, setFixtureMode] = useState(false);
-  const [error, setError] = useState<string>();
-  const [loading, setLoading] = useState(true);
-  const lastStreamRefresh = useRef(0);
-
-  const refreshRuns = useCallback(async () => setRuns(listFrom(await api.runs(), 'runs')), []);
-  const refreshTopology = useCallback(async (runId?: string) => setGraph(await api.topology(runId)), []);
-  const refreshRun = useCallback(async (runId: string) => {
-    const [run] = await Promise.all([api.run(runId), refreshTopology(runId)]);
-    setSnapshot(run); updateUrl(runId);
-  }, [refreshTopology]);
-  const refreshLive = useCallback(async () => {
-    const [integrationsResult, topologyResult, runsResult] = await Promise.allSettled([api.integrations(), api.topology(), api.runs()]);
-    const errors: string[] = [];
-    if (integrationsResult.status === 'fulfilled') setIntegrations(normalizeIntegrations(integrationsResult.value)); else errors.push('integrations unavailable');
-    if (topologyResult.status === 'fulfilled') setGraph(topologyResult.value); else errors.push('topology unavailable');
-    if (runsResult.status === 'fulfilled') setRuns(listFrom(runsResult.value, 'runs')); else errors.push('saved runs unavailable');
-    if (errors.length) setError(`Live API error: ${errors.join(', ')}.`);
-  }, []);
-  useEffect(() => { void (async () => { await refreshLive(); const requested = new URLSearchParams(window.location.search).get('runId'); if (requested) { try { await refreshRun(requested); } catch { setError('Live API error: unable to load selected run.'); } } setLoading(false); })(); }, [refreshLive, refreshRun]);
-
-  const selectRun = useCallback(async (runId: string) => {
-    setError(undefined); setPair('original');
-    if (!runId) { setSnapshot(undefined); setDiagnostic(undefined); updateUrl(undefined); try { await refreshTopology(); } catch { setError('Live API error: unable to load template topology.'); } return; }
-    try { await refreshRun(runId); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Unable to load saved run.'); }
-  }, [refreshRun, refreshTopology]);
-  const refreshForStream = useCallback(async (runId: string) => {
-    if (fixtureMode || Date.now() - lastStreamRefresh.current < 700) return;
-    lastStreamRefresh.current = Date.now();
-    try { await refreshRun(runId); } catch { setError('Live API error: unable to resync stream snapshot.'); }
-  }, [fixtureMode, refreshRun]);
-  const perform = useCallback(async (work: () => Promise<void>) => { setError(undefined); try { await work(); await refreshRuns(); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Action failed.'); } }, [refreshRuns]);
-  const runExperiment = () => { if (fixtureMode) return; const key = operationKey(); setPair('original'); void perform(async () => { const { runId } = await api.startRun(key); await refreshRun(runId); }); };
-  const reproduce = () => { if (!snapshot || fixtureMode) return; const key = operationKey(); void perform(async () => { await api.reproduce(snapshot.id, key); await refreshRun(snapshot.id); }); };
-  const investigate = () => { if (!snapshot || fixtureMode) return; const key = operationKey(); void perform(async () => { const result = await api.investigate(snapshot.id, key); setDiagnostic(await api.diagnostic(result.diagnosticId)); }); };
-  const cancelRun = () => { if (!snapshot || fixtureMode) return; void perform(async () => { await api.cancel(snapshot.id); await refreshRun(snapshot.id); }); };
-  const cancelDiagnostic = useCallback(() => { if (!diagnostic || fixtureMode) return; void (async () => { try { await api.cancelDiagnostic(diagnostic.id); setDiagnostic(await api.diagnostic(diagnostic.id)); } catch { setError('Live API error: unable to cancel diagnostic.'); } })(); }, [diagnostic, fixtureMode]);
+  const [snapshot, setSnapshot] = useState<RunSnapshot>(); const [graph, setGraph] = useState<TopologyGraph>(); const [runs, setRuns] = useState<RunSummary[]>([]); const [integrations, setIntegrations] = useState<IntegrationStatus[]>([]); const [selectedNodeId, setSelectedNodeId] = useState<string>(); const [pair, setPair] = useState<'original' | 'reproduction'>('original'); const [diagnostic, setDiagnostic] = useState<DiagnosticSession>(); const [fixtureMode, setFixtureMode] = useState(false); const [actionBusy, setActionBusy] = useState(false); const [reproductionClicked, setReproductionClicked] = useState(false); const [expectedReproductionTrialIds, setExpectedReproductionTrialIds] = useState<readonly string[]>([]); const [error, setError] = useState<string>(); const [loading, setLoading] = useState(true);
+  const reproductionStartedAtMs = useRef<number>(undefined); const snapshotRef = useRef<RunSnapshot>(undefined); const fixtureModeRef = useRef(false); const refreshSeq = useRef(0); const latestAppliedSeqRef = useRef(0); const selectedRunIdRef = useRef<string>(undefined); snapshotRef.current = snapshot; fixtureModeRef.current = fixtureMode;
+  const resetReproduction = useCallback(() => { setReproductionClicked(false); setExpectedReproductionTrialIds([]); reproductionStartedAtMs.current = undefined; }, []);
+  const refreshRuns = useCallback(async () => setRuns(listFrom(await api.runs())), []);
+  const refreshTopology = useCallback(async () => { const seq = ++refreshSeq.current; const nextGraph = await api.topology(); if (fixtureModeRef.current || selectedRunIdRef.current || seq <= latestAppliedSeqRef.current) return; latestAppliedSeqRef.current = seq; setGraph(nextGraph); }, []);
+  const refreshRun = useCallback(async (runId: string, opts?: { select?: boolean }) => { if (opts?.select) selectedRunIdRef.current = runId; else if (selectedRunIdRef.current !== runId) return; const seq = ++refreshSeq.current; try { const [run, nextGraph] = await Promise.all([api.run(runId), api.topology(runId)]); if (fixtureModeRef.current || selectedRunIdRef.current !== runId || seq <= latestAppliedSeqRef.current) return; latestAppliedSeqRef.current = seq; setSnapshot(run); setGraph(nextGraph); setRunUrl(runId); } catch (cause) { if (selectedRunIdRef.current === runId && seq >= latestAppliedSeqRef.current) throw cause; } }, []);
+  const refreshLive = useCallback(async () => { const seq = ++refreshSeq.current; const [integration, topology, savedRuns] = await Promise.allSettled([api.integrations(), api.topology(), api.runs()]); const failures: string[] = []; if (integration.status === 'fulfilled') setIntegrations(normalizeIntegrations(integration.value)); else failures.push('integrations unavailable'); if (topology.status === 'fulfilled') { if (!fixtureModeRef.current && !selectedRunIdRef.current && seq > latestAppliedSeqRef.current) { latestAppliedSeqRef.current = seq; setGraph(topology.value); } } else failures.push('topology unavailable'); if (savedRuns.status === 'fulfilled') setRuns(listFrom(savedRuns.value)); else failures.push('saved runs unavailable'); if (failures.length && !fixtureModeRef.current) setError(`Live API error: ${failures.join(', ')}.`); }, []);
+  useEffect(() => { void (async () => { await refreshLive(); const query = new URLSearchParams(window.location.search); const runId = query.get('runId'); const diagnosticId = query.get('diagnosticId'); if (runId) try { await refreshRun(runId, { select: true }); if (diagnosticId) { const restored = await api.diagnostic(diagnosticId); if (restored.runId === runId) setDiagnostic(restored); else setDiagnosticUrl(undefined); } } catch { setError('Live API error: unable to restore selected run.'); } setLoading(false); })(); }, [refreshLive, refreshRun]);
+  const reproductionBusy = isReproductionBusy(reproductionClicked, snapshot);
+  const diagnosticBusy = Boolean(diagnostic && !TERMINAL_DIAGNOSTIC.has(diagnostic.status));
+  useEffect(() => { if (!snapshot || fixtureMode || (!reproductionBusy && TERMINAL_RUN.has(snapshot.status))) return; const timer = window.setInterval(() => { void refreshRun(snapshot.id).then(() => { }).catch(() => setError('Live API error: unable to refresh run.')); }, 2_000); return () => window.clearInterval(timer); }, [snapshot, fixtureMode, reproductionBusy, refreshRun]);
+  useEffect(() => { if (reproductionClicked && isReproductionSettled(snapshot)) resetReproduction(); }, [reproductionClicked, resetReproduction, snapshot]);
   useEffect(() => {
-    if (!diagnostic || fixtureMode || TERMINAL_DIAGNOSTIC_STATUSES.has(diagnostic.status)) return;
-    const timer = window.setInterval(() => { void api.diagnostic(diagnostic.id).then(setDiagnostic).catch(() => setError('Live API error: unable to refresh diagnostic.')); }, 1_000);
-    return () => window.clearInterval(timer);
-  }, [diagnostic, fixtureMode]);
-  const showFixture = useCallback((enabled: boolean) => {
-    setFixtureMode(enabled); setError(undefined); setPair('original');
-    if (enabled) { setSnapshot(DEV_FIXTURE_RUN_SNAPSHOT); setGraph(DEV_FIXTURE_RUN_SNAPSHOT.graph); setDiagnostic(DEV_FIXTURE_DIAGNOSTIC_SESSION); updateUrl(undefined); return; }
-    const state = liveStateAfterFixture(); setSnapshot(state.snapshot); setGraph(state.graph); setDiagnostic(state.diagnostic); updateUrl(undefined); void refreshLive();
-  }, [refreshLive]);
-
-  const isFixtureSnapshot = fixtureMode || snapshot?.trials.some((trial) => trial.executionMode === 'development-local') === true;
-  const isBusy = Boolean(snapshot && !TERMINAL_RUN_STATUSES.has(snapshot.status));
-  return <main className="app-shell">{isFixtureSnapshot && <div className="fixture-banner" role="status">{DEV_FIXTURE_BANNER}</div>}<header className="app-header"><div className="brand"><strong>Entropy</strong><span>Cascade experiment</span></div><div className="header-meta"><span>Source revision <code>{snapshot?.sourceSha ?? 'not loaded'}</code></span><span>Stage <strong>{snapshot?.status ?? (loading ? 'LOADING' : 'IDLE')}</strong></span></div><div className="integration-status">{integrations.map((item) => <span key={item.name} className={`status-text ${item.status}`}>● {item.name}</span>)}</div><div className="header-actions"><button className="primary" onClick={runExperiment} disabled={isBusy || fixtureMode}>Run Experiment</button><button onClick={cancelRun} disabled={!snapshot || !isBusy || fixtureMode}>Cancel</button><button onClick={reproduce} disabled={!snapshot || isBusy || fixtureMode}>Reproduce</button><button onClick={investigate} disabled={!snapshot || isBusy || fixtureMode}>Investigate</button><label className="compact-label">Saved runs <select value={snapshot?.id ?? ''} onChange={(event) => void selectRun(event.target.value)} disabled={fixtureMode}><option value="">Select a run</option>{runs.map((run) => <option value={run.id} key={run.id}>{run.id} · {run.status}</option>)}</select></label><label className="fixture-toggle"><input type="checkbox" checked={fixtureMode} onChange={(event) => showFixture(event.target.checked)} /> Load Labeled Dev Fixture</label></div></header>{error && <div className="error-message" role="alert">{error}</div>}<div className="dashboard-grid"><HypothesisCard hypothesis={snapshot?.hypothesis} /><TrialComparison snapshot={snapshot} pair={pair} onPairChange={setPair} /><TopologyGraphView graph={graph} predictedIds={snapshot?.hypothesis?.predictedBlastRadiusIds ?? []} selectedNodeId={selectedNodeId} onSelect={setSelectedNodeId} /><EvidenceDrawer snapshot={snapshot} serviceId={selectedNodeId} pair={pair} /><AnalysisPanel snapshot={snapshot} />{snapshot && !fixtureMode && <TerminalFeed runId={snapshot.id} terminal={TERMINAL_RUN_STATUSES.has(snapshot.status)} onResync={refreshForStream} />}<DiagnosticDrawer diagnostic={diagnostic} onCancel={cancelDiagnostic} /></div></main>;
+    if (!reproductionClicked) return;
+    const startedAt = reproductionStartedAtMs.current ?? Date.now(); reproductionStartedAtMs.current = startedAt;
+    const timer = window.setTimeout(() => {
+      if (hasReproductionWaitExpired(reproductionStartedAtMs.current, Date.now(), expectedReproductionTrialIds, snapshotRef.current)) { resetReproduction(); setError(`Live API error: reproduction wait deadline expired${expectedReproductionTrialIds.length ? ` (${expectedReproductionTrialIds.join(', ')})` : ''}.`); }
+    }, REPRODUCTION_WAIT_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [expectedReproductionTrialIds, reproductionClicked, resetReproduction]);
+  const streamRefresh = useCallback(async (runId: string) => { if (fixtureMode) return; try { await refreshRun(runId); } catch { setError('Live API error: unable to resync stream snapshot.'); } }, [fixtureMode, refreshRun]);
+  const streamScheduler = useMemo(() => createTrailingRefreshScheduler(() => snapshot ? streamRefresh(snapshot.id) : Promise.resolve()), [snapshot?.id, streamRefresh]);
+  useEffect(() => () => streamScheduler.dispose(), [streamScheduler]);
+  const onStreamResync = useCallback(() => streamScheduler.schedule(), [streamScheduler]);
+  const perform = useCallback(async (work: () => Promise<void>) => { setActionBusy(true); setError(undefined); try { await work(); await refreshRuns(); return true; } catch (cause) { setError(cause instanceof Error ? cause.message : 'Action failed.'); return false; } finally { setActionBusy(false); } }, [refreshRuns]);
+  const selectRun = useCallback(async (runId: string) => { setError(undefined); setPair('original'); resetReproduction(); if (clearDiagnosticForRunSwitch(snapshot?.id, runId) === undefined) { setDiagnostic(undefined); setDiagnosticUrl(undefined); } if (!runId) { selectedRunIdRef.current = undefined; latestAppliedSeqRef.current = ++refreshSeq.current; setSnapshot(undefined); setRunUrl(undefined); try { await refreshTopology(); } catch { setError('Live API error: unable to load template topology.'); } return; } try { await refreshRun(runId, { select: true }); } catch (cause) { if (selectedRunIdRef.current === runId) selectedRunIdRef.current = snapshotRef.current?.id; setError(cause instanceof Error ? cause.message : 'Unable to load saved run.'); } }, [refreshRun, refreshTopology, resetReproduction, snapshot?.id]);
+  const runExperiment = () => { if (fixtureMode || actionBusy || reproductionBusy || diagnosticBusy) return; setPair('original'); resetReproduction(); setDiagnostic(undefined); setDiagnosticUrl(undefined); void perform(async () => { const { runId } = await api.startRun(operationKey()); try { await refreshRun(runId, { select: true }); } catch (cause) { if (selectedRunIdRef.current === runId) selectedRunIdRef.current = snapshotRef.current?.id; throw cause; } }); };
+  const reproduce = () => { if (!snapshot || hasReproduction(snapshot) || fixtureMode || actionBusy || reproductionBusy || diagnosticBusy) return; reproductionStartedAtMs.current = Date.now(); setReproductionClicked(true); void perform(async () => { const result = await api.reproduce(snapshot.id, operationKey()); setExpectedReproductionTrialIds(result?.trialIds ?? []); await refreshRun(snapshot.id); }).then((accepted) => { if (!accepted) resetReproduction(); }); };
+  const investigate = () => { if (!snapshot || fixtureMode || actionBusy || reproductionBusy || diagnosticBusy) return; void perform(async () => { const result = await api.investigate(snapshot.id, operationKey()); setDiagnosticUrl(result.diagnosticId); setDiagnostic(await api.diagnostic(result.diagnosticId)); }); };
+  const cancelRun = () => { if (!snapshot || fixtureMode || actionBusy) return; void perform(async () => { await api.cancel(snapshot.id); await refreshRun(snapshot.id); }); };
+  const cancelDiagnostic = useCallback(() => { if (!diagnostic || fixtureMode) return; void api.cancelDiagnostic(diagnostic.id).then(() => api.diagnostic(diagnostic.id)).then(setDiagnostic).catch(() => setError('Live API error: unable to cancel diagnostic.')); }, [diagnostic, fixtureMode]);
+  useEffect(() => { if (!diagnostic || fixtureMode || TERMINAL_DIAGNOSTIC.has(diagnostic.status)) return; const timer = window.setInterval(() => void api.diagnostic(diagnostic.id).then(setDiagnostic).catch(() => setError('Live API error: unable to refresh diagnostic.')), 1_000); return () => window.clearInterval(timer); }, [diagnostic, fixtureMode]);
+  const showFixture = useCallback((enabled: boolean) => { fixtureModeRef.current = enabled; selectedRunIdRef.current = undefined; latestAppliedSeqRef.current = ++refreshSeq.current; setFixtureMode(enabled); setError(undefined); setPair('original'); resetReproduction(); if (enabled) { setSnapshot(DEV_FIXTURE_RUN_SNAPSHOT); setGraph(DEV_FIXTURE_RUN_SNAPSHOT.graph); setDiagnostic(DEV_FIXTURE_DIAGNOSTIC_SESSION); setRunUrl(undefined); setDiagnosticUrl(undefined); return; } const state = liveStateAfterFixture(); setSnapshot(state.snapshot); setGraph(state.graph); setDiagnostic(state.diagnostic); setRunUrl(undefined); setDiagnosticUrl(undefined); void refreshLive(); }, [refreshLive, resetReproduction]);
+  const selectEvidence = useCallback((id: string) => { const serviceId = serviceForEvidence(snapshot, id); if (serviceId) setSelectedNodeId(serviceId); }, [snapshot]);
+  const developmentLocal = !fixtureMode && snapshot?.trials.some((trial) => trial.executionMode === 'development-local'); const isBusy = Boolean(snapshot && !TERMINAL_RUN.has(snapshot.status));
+  return <main className="app-shell">{fixtureMode && <div className="fixture-banner" role="status">{DEV_FIXTURE_BANNER}</div>}{developmentLocal && <div className="fixture-banner" role="status">{DEVELOPMENT_LOCAL_BANNER}</div>}<header className="app-header"><div className="brand"><strong>Entropy</strong><span>Cascade experiment</span></div><div className="header-meta"><span>Source revision <code>{snapshot?.sourceSha ?? 'not loaded'}</code></span><span>Stage <strong>{snapshot?.status ?? (loading ? 'LOADING' : 'IDLE')}</strong></span></div><div className="integration-status">{integrations.map((item) => <span key={item.name} title={item.checkedAt ? `Checked ${item.checkedAt}` : undefined} className={`status-text ${item.status}`}>● {item.name}: {item.status}{item.checkedAt ? ` (${item.checkedAt})` : ''}</span>)}</div><div className="header-actions"><button className="primary" onClick={runExperiment} disabled={isBusy || fixtureMode || actionBusy || reproductionBusy || diagnosticBusy}>Run Experiment</button><button onClick={cancelRun} disabled={!snapshot || !isBusy || fixtureMode || actionBusy}>Cancel</button><button onClick={reproduce} disabled={!snapshot || hasReproduction(snapshot) || isBusy || fixtureMode || actionBusy || reproductionBusy || diagnosticBusy}>Reproduce</button><button onClick={investigate} disabled={!snapshot || isBusy || fixtureMode || actionBusy || reproductionBusy || diagnosticBusy}>Investigate</button><label className="compact-label">Saved runs <select value={snapshot?.id ?? ''} onChange={(event) => void selectRun(event.target.value)} disabled={fixtureMode}><option value="">Select a run</option>{runs.map((run) => <option value={run.id} key={run.id}>{run.id} · {run.status}</option>)}</select></label><label className="fixture-toggle"><input type="checkbox" checked={fixtureMode} onChange={(event) => showFixture(event.target.checked)} /> Load Labeled Dev Fixture</label></div></header>{error && <div className="error-message" role="alert">{error}</div>}<div className="dashboard-grid"><HypothesisCard hypothesis={snapshot?.hypothesis} /><TrialComparison snapshot={snapshot} pair={pair} onPairChange={setPair} /><TopologyGraphView graph={graph} predictedIds={snapshot?.hypothesis?.predictedBlastRadiusIds ?? []} selectedNodeId={selectedNodeId} onSelect={setSelectedNodeId} /><EvidenceDrawer snapshot={snapshot} serviceId={selectedNodeId} pair={pair} /><AnalysisPanel snapshot={snapshot} onSelectEvidence={selectEvidence} />{snapshot && !fixtureMode && <TerminalFeed runId={snapshot.id} terminal={Boolean(snapshot && TERMINAL_RUN.has(snapshot.status) && !reproductionBusy && !diagnosticBusy)} onResync={onStreamResync} />}<DiagnosticDrawer diagnostic={diagnostic} onCancel={cancelDiagnostic} /></div></main>;
 }

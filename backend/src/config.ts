@@ -2,7 +2,6 @@ import path from 'node:path';
 import dotenv from 'dotenv';
 
 dotenv.config({ path: path.resolve(__dirname, '../../.env'), quiet: true });
-dotenv.config({ path: path.resolve(process.cwd(), '.env'), override: true, quiet: true });
 
 export interface Config {
   api: { host: string; port: number };
