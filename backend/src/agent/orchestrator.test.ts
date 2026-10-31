@@ -186,6 +186,14 @@ describe('Orchestrator', () => {
     await expect(orchestrator.investigate(runId, key)).rejects.toMatchObject({ code: 'OPERATION_KEY_REUSED', httpStatus: 409 });
   });
 
+  it('records configured development labels (e.g. the in-memory graph store) on every run', async () => {
+    const repository = new Neo4jGraphRepository({ inMemory: true });
+    const orchestrator = new Orchestrator({ repository, nosana, provider: new FakeProvider(), budget: new SandboxBudget(2), events: new EventHub(repository), payloadSelector: SHA, createId: () => `run-${++ids}`, recoveryDir: path.join(tempDir, 'recovery'), runWarnings: ['DEVELOPMENT graph store: in-memory, not Neo4j.'] });
+    const { runId } = await orchestrator.startRun('34343434-3434-4343-8343-343434343434');
+    await orchestrator.idle();
+    expect((await repository.getRun(runId))!.warnings).toContain('DEVELOPMENT graph store: in-memory, not Neo4j.');
+  });
+
   it('stops after an invalid baseline without scheduling matched trials', async () => {
     const provider = new FakeProvider();
     provider.failExecuteFor.add('baseline');

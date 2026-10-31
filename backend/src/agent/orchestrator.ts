@@ -56,6 +56,8 @@ export interface OrchestratorDeps {
   diagnostics?: DiagnosticLauncher;
   /** Shown in events; the development in-memory store must not claim to be Neo4j. */
   graphSourceLabel?: string;
+  /** Environment-level labels recorded on every run (e.g. a development graph store). */
+  runWarnings?: string[];
   createId?: () => string;
   recoveryDir?: string;
   limits?: Partial<typeof WORKFLOW_LIMITS>;
@@ -570,7 +572,7 @@ export class Orchestrator implements OrchestratorContract {
   }
 
   private payloadWarnings(payload: LoadedPayload): string[] {
-    const warnings: string[] = [];
+    const warnings: string[] = [...(this.deps.runWarnings ?? [])];
     if (payload.manifest.development) warnings.push(`DEVELOPMENT payload bundled from the working tree at HEAD ${payload.manifest.sourceSha.slice(0, 12)}; not a recorded immutable source.`);
     if (this.deps.provider.executionMode === 'development-local') warnings.push('DEVELOPMENT execution: trials ran as local processes, not Daytona sandboxes. Excluded from live acceptance.');
     return warnings;
