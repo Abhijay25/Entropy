@@ -13,10 +13,18 @@
     "dev:frontend": "npm run dev --workspace=@entropy/frontend",
     "build": "npm run build --workspaces --if-present",
     "demo": "npm run dev:backend & npm run dev:frontend & wait",
-    "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "vitest run"
+    "typecheck": "npm run typecheck --workspaces --if-present && tsc -p scripts/tsconfig.json",
+    "test": "vitest run",
+    "doctor": "tsx scripts/doctor.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "payload:check": "tsx scripts/payloadCheck.ts",
+    "prepare:payload": "tsx scripts/preparePayload.ts",
+    "cleanup": "tsx scripts/cleanup.ts"
   },
   "devDependencies": {
+    "esbuild": "0.28.2",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
     "vitest": "^4.0.18"
   }
 }

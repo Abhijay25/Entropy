@@ -1,15 +1,17 @@
 import path from 'node:path';
 import dotenv from 'dotenv';
 
-dotenv.config({ path: path.resolve(__dirname, '../../.env') });
-dotenv.config({ path: path.resolve(process.cwd(), '.env'), override: true });
+dotenv.config({ path: path.resolve(__dirname, '../../.env'), quiet: true });
+dotenv.config({ path: path.resolve(process.cwd(), '.env'), override: true, quiet: true });
 
 export interface Config {
   api: { host: string; port: number };
   daytona: { apiKey?: string; apiUrl?: string; target?: string; snapshot?: string };
   neo4j: { uri?: string; username: string; password?: string; database: string };
   nosana: { baseUrl: string; apiKey?: string; model?: string };
-  entropy: { sourceSha?: string; maxSandboxes: number };
+  daytonaCli: { path: string };
+  /** 'live' requires every sponsor; 'development' allows explicitly labeled local substitutes. */
+  entropy: { sourceSha?: string; maxSandboxes: number; mode: 'live' | 'development' };
 }
 
 function optionalEnv(name: string): string | undefined {
@@ -48,8 +50,18 @@ export const config: Config = {
     apiKey: optionalEnv('NOSANA_API_KEY'),
     model: optionalEnv('NOSANA_MODEL')
   },
+  daytonaCli: {
+    path: optionalEnv('DAYTONA_CLI_PATH') ?? 'daytona'
+  },
   entropy: {
     sourceSha: optionalEnv('ENTROPY_SOURCE_SHA'),
-    maxSandboxes: integerEnv('ENTROPY_MAX_SANDBOXES', 2, 1, 2)
+    maxSandboxes: integerEnv('ENTROPY_MAX_SANDBOXES', 2, 1, 2),
+    mode: modeEnv()
   }
 };
+
+function modeEnv(): 'live' | 'development' {
+  const value = optionalEnv('ENTROPY_MODE') ?? 'live';
+  if (value !== 'live' && value !== 'development') throw new Error('ENTROPY_MODE must be "live" or "development".');
+  return value;
+}
