@@ -2,7 +2,7 @@ import type { RunSnapshot, TrialTelemetry } from '@entropy/shared';
 
 interface Props { snapshot?: RunSnapshot; pair: 'original' | 'reproduction'; onPairChange: (pair: 'original' | 'reproduction') => void; }
 const labels: Record<string, string> = { baseline: 'Baseline', control: 'Control', chaos: 'Chaos', 'reproduction-control': 'Reproduction control', 'reproduction-chaos': 'Reproduction chaos' };
-const measured = (value: number | null | undefined, suffix = '') => value == null ? 'not measured' : `${value}${suffix}`;
+const measured = (value: number | null | undefined, suffix = '') => value == null ? 'not measured' : `${Number.isInteger(value) ? value : value.toFixed(1)}${suffix}`;
 const SMALL_SAMPLE_THRESHOLD = 20;
 export const isSmallCheckoutSample = (sampleCount: number) => sampleCount < SMALL_SAMPLE_THRESHOLD;
 function trialFor(trials: readonly TrialTelemetry[], kind: string) { return trials.find((trial) => trial.kind === kind); }

@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { Background, Controls, ReactFlow, type Edge, type Node } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import type { DependencyEdge, ServiceNode, TopologyGraph as Topology } from '@entropy/shared';
@@ -10,8 +11,12 @@ export type EdgeStyle = 'configured' | 'predicted' | 'observed';
 export function edgeStyle(edge: DependencyEdge): EdgeStyle { return edge.evidenceKind; }
 interface Props { graph?: Topology; predictedIds: readonly string[]; selectedNodeId?: string; onSelect: (serviceId: string) => void; }
 
+// Inline colors: React Flow's unlayered stylesheet overrides the layered .topology-node rules.
+const STATUS_BORDER: Record<ServiceNode['status'], string> = { HEALTHY: 'var(--green)', DEGRADED: 'var(--amber)', DOWN: 'var(--red)', UNKNOWN: 'var(--gray)' };
+
 function graphNode(node: ServiceNode, selectedNodeId?: string): Node {
-  return { id: node.id, position: POSITIONS[node.id] ?? { x: 0, y: 0 }, data: { label: <><strong>{node.name}</strong><small>{node.mock ? 'mock datastore' : `:${node.port}`} - {node.status}</small></> }, className: `topology-node status-${node.status.toLowerCase()}${selectedNodeId === node.id ? ' is-selected' : ''}` };
+  const kind = node.type === 'Datastore' ? 'datastore' : 'service';
+  return { id: node.id, position: POSITIONS[node.id] ?? { x: 0, y: 0 }, data: { label: <><strong>{node.name}</strong><small>{node.mock ? `mock ${kind}` : kind} :{node.port} - {node.status}</small></> }, className: `topology-node status-${node.status.toLowerCase()}${selectedNodeId === node.id ? ' is-selected' : ''}`, style: { background: '#1c232c', color: 'var(--text)', border: `1px solid ${STATUS_BORDER[node.status]}` } };
 }
 export function flowEdge(edge: DependencyEdge): Edge {
   const style = edgeStyle(edge);
@@ -33,7 +38,13 @@ export function predictedEdges(graph: Topology, predictedIds: readonly string[])
 }
 
 export function TopologyGraph({ graph, predictedIds, selectedNodeId, onSelect }: Props) {
+  // React Flow hides a node until it is measured, and only re-measures on a size change. Rebuilding
+  // identical node objects on unrelated re-renders therefore leaves them hidden, so rebuild only
+  // when the graph content, selection, or prediction actually changes.
+  const graphKey = graph ? JSON.stringify(graph) : '';
+  const predictedKey = predictedIds.join('|');
+  const nodes = useMemo(() => graph?.nodes.map((node) => graphNode(node, selectedNodeId)) ?? [], [graphKey, selectedNodeId]);
+  const edges = useMemo(() => graph ? [...graph.edges.map(flowEdge), ...predictedEdges(graph, predictedIds)] : [], [graphKey, predictedKey]);
   if (!graph) return <section className="panel topology-panel"><p className="eyebrow">Topology</p><h2>Loading topology</h2><p className="muted">Waiting for the live topology API.</p></section>;
-  const nodes = graph.nodes.map((node) => graphNode(node, selectedNodeId));
-  return <section className="panel topology-panel" aria-label="Service topology"><div className="panel-heading"><div><p className="eyebrow">Topology</p><h2>Configured dependencies and measured cascade</h2></div><span className="status-text unknown">● telemetry governs health</span></div><div className="topology-canvas"><ReactFlow nodes={nodes} edges={[...graph.edges.map(flowEdge), ...predictedEdges(graph, predictedIds)]} fitView fitViewOptions={{ padding: 0.2 }} minZoom={0.45} maxZoom={1.8} onNodeClick={(_, node) => onSelect(node.id)} nodesDraggable={false} nodesConnectable={false} elementsSelectable><Background gap={18} size={1} color="#2a3038" /><Controls showInteractive={false} /></ReactFlow></div><div className="legend"><span><i className="legend-line" /> configured caller → dependency</span><span><i className="legend-line predicted" /> proposed path</span><span><i className="legend-line observed" /> observed dependency → affected caller</span><span>UNKNOWN = no samples</span></div></section>;
+  return <section className="panel topology-panel" aria-label="Service topology"><div className="panel-heading"><div><p className="eyebrow">Topology</p><h2>Configured dependencies and measured cascade</h2></div><span className="status-text unknown">● telemetry governs health</span></div><div className="topology-canvas"><ReactFlow nodes={nodes} edges={edges} fitView fitViewOptions={{ padding: 0.2 }} minZoom={0.45} maxZoom={1.8} onNodeClick={(_, node) => onSelect(node.id)} nodesDraggable={false} nodesConnectable={false} elementsSelectable><Background gap={18} size={1} color="#2a3038" /><Controls showInteractive={false} /></ReactFlow></div><div className="legend"><span><i className="legend-line" /> configured caller → dependency</span><span><i className="legend-line predicted" /> proposed path</span><span><i className="legend-line observed" /> observed dependency → affected caller</span><span>UNKNOWN = no samples</span></div></section>;
 }
