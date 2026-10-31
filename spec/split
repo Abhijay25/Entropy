@@ -1,0 +1,244 @@
+# Entropy — ChaosAgent (Autonomous Site Reliability & Blast-Radius Engine)
+
+## 1. Overview & Problem Statement
+Microservices are tangled webs of dependencies. When one service slows down or crashes, it can trigger a domino effect across upstream applications. Site Reliability Engineers (SREs) struggle to forecast the **blast radius** of a failure before it happens in production.
+
+**ChaosAgent (Entropy)** is an offensive, autonomous reliability agent that:
+1. **Maps Topology (Neo4j)**: Stores microservice architecture as a directed dependency graph and uses GraphRAG to identify single points of failure and synchronous dependency bottlenecks.
+2. **Generates Failure Hypotheses (Nosana)**: Queries the Neo4j graph and uses a Nosana-hosted LLM to formulate targeted chaos hypotheses (e.g., *"If RedisCache latency spikes to 3,000ms, will synchronous token verification in PaymentService exhaust its worker pool and hang the Frontend checkout flow?"*).
+3. **Executes & Measures Blast Radius (Daytona)**: Spins up an isolated **Daytona** sandbox running a miniature multi-service mock cluster, injects real faults (latency spikes, packet drops, process kills), fires concurrent user traffic, and measures p50/p95/p99 latencies and cascading timeouts.
+4. **Maps the Cascade & Self-Heals (Neo4j + Nosana + Daytona)**: Updates Neo4j in real time—highlighting cascaded nodes in **RED**—generates a concrete TypeScript circuit-breaker/timeout remediation patch via Nosana, hot-applies the fix inside the Daytona sandbox, and re-runs the chaos test to prove the blast radius shrinks from 5 red nodes to 1 isolated node.
+
+---
+
+## 2. Cascading Failure Topology (6-Node Service Mesh)
+
+To demonstrate a dramatic, realistic cascading failure in Neo4j:
+
+- `(:Service {id: "frontend", name: "Frontend"})-[:CALLS]->(:Service {id: "order-service", name: "OrderService"})`
+- `(:Service {id: "order-service", name: "OrderService"})-[:CALLS]->(:Service {id: "payment-service", name: "PaymentService"})`
+- `(:Service {id: "payment-service", name: "PaymentService"})-[:WRITES]->(:Datastore {id: "postgres-db", name: "PostgresDB"})`
+- `(:Service {id: "frontend", name: "Frontend"})-[:CALLS]->(:Service {id: "auth-service", name: "AuthService"})`
+- `(:Service {id: "auth-service", name: "AuthService"})-[:READS]->(:Datastore {id: "redis-cache", name: "RedisCache"})`
+- `(:Service {id: "payment-service", name: "PaymentService"})-[:VERIFY_TOKEN {timeoutMs: null, circuitBreaker: false}]->(:Service {id: "auth-service", name: "AuthService"})`
+
+### The Domino Effect
+1. **Fault Injected**: `RedisCache` latency spikes to `3000ms` inside the Daytona sandbox.
+2. **Direct Impact**: `AuthService` blocks waiting on `RedisCache`.
+3. **Hidden Cascade**: `PaymentService` calls `AuthService` synchronously without a timeout or circuit breaker; its worker pool saturates.
+4. **Upstream Collapse**: `OrderService` requests to `PaymentService` queue up and time out (`504`), causing `Frontend` checkout requests to fail—turning **5 of 6 nodes RED** (`DOWN` / `DEGRADED`) in Neo4j.
+5. **Self-Healing Verification**: Applying the Nosana-generated timeout (`500ms`) + circuit-breaker fallback patch on `PaymentService -> AuthService` isolates the fault so checkout degrades gracefully (`1 degraded node`, `0 failed checkouts`).
+
+---
+
+## 3. Repository Structure (100% TypeScript)
+
+```text
+Entropy/
+├── package.json                  # Workspace scripts (dev, build, demo)
+├── .env.example                  # Daytona, Neo4j, and Nosana credentials
+├── shared/
+│   └── types.ts                  # Shared TypeScript contract between Person A & Person B
+├── backend/
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── src/
+│       ├── index.ts              # Express + SSE live event server
+│       ├── config.ts             # Typed env configuration (Daytona, Neo4j, Nosana)
+│       ├── graph/
+│       │   └── neo4jClient.ts    # neo4j-driver + in-memory GraphRAG mirror & Cypher queries
+│       ├── agent/
+│       │   ├── nosanaClient.ts   # Nosana OpenAI-compatible TS client (hypotheses & patches)
+│       │   └── orchestrator.ts   # Autonomous chaos & self-healing verification loop
+│       └── sandbox/
+│           ├── daytonaRunner.ts  # @daytonaio/sdk sandbox provisioning + local TS fallback
+│           └── payload/          # Zero-dependency Node .mjs scripts uploaded into Daytona sandbox
+│               ├── cluster.mjs   # Multi-port microservice mesh + TCP Chaos Proxy (Frontend, Order, Payment, Auth, Redis, PG)
+│               ├── faultCtl.mjs  # CLI to inject TCP socket latency, SIGSTOP/SIGKILL, error spikes, or hot-patch
+│               └── trafficGen.mjs# Concurrent load generator outputting p50/p95/p99 & cascade JSON
+└── frontend/                     # React + TypeScript + Vite + Tailwind Mission Control UI
+    ├── package.json
+    ├── tsconfig.json
+    └── src/
+        ├── App.tsx               # Chaos Mission Control dashboard
+        └── components/
+            ├── TopologyGraph.tsx # Interactive dependency & blast-radius graph (green/yellow/red cascade)
+            ├── TerminalFeed.tsx  # Live Daytona sandbox command & telemetry stream
+            ├── HypothesisCard.tsx# Nosana GraphRAG hypothesis & predicted vs. actual blast radius
+            └── PatchModal.tsx    # Generated TypeScript circuit-breaker diff & 1-click Daytona re-test
+```
+
+---
+
+## 4. Shared TypeScript Contract (`shared/types.ts`)
+
+Both teammates code against these interfaces so integration has zero friction:
+
+```typescript
+export type NodeHealthStatus = 'HEALTHY' | 'DEGRADED' | 'DOWN';
+
+export interface ServiceNode {
+  id: string;
+  name: string;
+  type: 'Service' | 'Datastore';
+  port: number;
+  status: NodeHealthStatus;
+  latencyP95Ms?: number;
+  errorRate?: number; // 0.0 to 1.0
+}
+
+export interface DependencyEdge {
+  source: string;
+  target: string;
+  relationship: 'CALLS' | 'READS' | 'WRITES' | 'VERIFY_TOKEN' | 'CASCADED_TO';
+  hasTimeout?: boolean;
+  hasCircuitBreaker?: boolean;
+  cascadeLatencyMs?: number;
+}
+
+export interface TopologyGraph {
+  nodes: ServiceNode[];
+  edges: DependencyEdge[];
+}
+
+export type FaultType = 'LATENCY_SPIKE' | 'SERVICE_KILL' | 'ERROR_RATE';
+
+export interface ChaosHypothesis {
+  id: string;
+  title: string;
+  question: string;
+  targetServiceId: string;
+  faultType: FaultType;
+  faultParams: {
+    delayMs?: number;
+    errorRate?: number;
+    durationSec: number;
+  };
+  predictedBlastRadiusIds: string[];
+  rationale: string;
+  cypherQueryUsed: string;
+}
+
+export interface ServiceMetric {
+  serviceId: string;
+  status: NodeHealthStatus;
+  requestsTotal: number;
+  errorsTotal: number;
+  errorRate: number;
+  latencyP50Ms: number;
+  latencyP95Ms: number;
+  latencyP99Ms: number;
+}
+
+export interface SandboxTelemetry {
+  sandboxId: string;
+  executionMode: 'daytona' | 'local-fallback';
+  faultCommandExecuted: string;
+  baselineMetrics: Record<string, ServiceMetric>;
+  chaosMetrics: Record<string, ServiceMetric>;
+  postPatchMetrics?: Record<string, ServiceMetric>;
+  actualBlastRadiusIds: string[];
+  postPatchBlastRadiusIds?: string[];
+  cascadedEdges: Array<{ from: string; to: string; latencyMs: number; errorRate: number }>;
+  terminalLogs: string[];
+}
+
+export interface RemediationPatch {
+  targetServiceId: string;
+  filePath: string;
+  summary: string;
+  explanation: string;
+  codeDiff: string;
+  policyConfig: {
+    timeoutMs: number;
+    circuitBreakerThreshold: number;
+    fallbackMode: 'cached-token' | 'fail-fast';
+  };
+}
+
+export type OrchestratorState =
+  | 'IDLE'
+  | 'RUNNING_CHAOS'
+  | 'CASCADE_DETECTED'
+  | 'REMEDIATING'
+  | 'VERIFIED';
+
+export type AgentEventType =
+  | 'GRAPH_LOADED'
+  | 'HYPOTHESIS_GENERATED'
+  | 'SANDBOX_PROVISIONING'
+  | 'BASELINE_TRAFFIC_COMPLETE'
+  | 'FAULT_INJECTED'
+  | 'CASCADE_DETECTED'
+  | 'NEO4J_BLAST_RADIUS_UPDATED'
+  | 'REMEDIATION_GENERATED'
+  | 'PATCH_APPLIED'
+  | 'VERIFICATION_COMPLETE'
+  | 'TERMINAL_LOG'
+  | 'ERROR';
+
+export interface AgentStreamEvent {
+  type: AgentEventType;
+  timestamp: string;
+  message: string;
+  payload?: {
+    graph?: TopologyGraph;
+    hypothesis?: ChaosHypothesis;
+    telemetry?: SandboxTelemetry;
+    patch?: RemediationPatch;
+    logLine?: string;
+  };
+}
+```
+
+---
+
+## 5. Two-Person Workload Split (2.5-Hour Hackathon Schedule)
+
+### Person A — "The Wrecker" (Daytona Sandbox, Microservice Mesh & Orchestrator API)
+- **External Setup**: Grabs the **Daytona API key** (`DAYTONA_API_KEY`, `DAYTONA_API_URL`) and verifies sandbox creation.
+- **Files Owned (Zero overlap with Person B)**:
+  - `backend/src/sandbox/payload/cluster.ts` — Multi-port HTTP microservice mesh (`Frontend`, `OrderService`, `PaymentService`, `AuthService`, `RedisCache`, `PostgresDB`) with realistic worker-pool exhaustion and hot-patch toggle.
+  - `backend/src/sandbox/payload/faultCtl.ts` & `trafficGen.ts` — Fault injector (`latency`, `error_rate`, `kill`, `patch`) and concurrent traffic generator returning p50/p95/p99 & error cascades.
+  - `backend/src/sandbox/daytonaRunner.ts` — `@daytonaio/sdk` runner (with local child-process fallback) that boots the sandbox, runs baseline traffic, injects faults, and returns `SandboxTelemetry`.
+  - `backend/src/agent/orchestrator.ts` & `backend/src/index.ts` — Express server + SSE event stream (`GET /api/stream`, `POST /api/chaos/run`, `POST /api/chaos/remediate`, `POST /api/topology/reset`).
+
+### Person B — "The Brain & Visualizer" (Neo4j GraphRAG, Nosana AI & Mission Control UI)
+- **External Setup**: Spins up **Neo4j** (AuraDB free tier or local Docker) and grabs the **Nosana** endpoint/key (`NOSANA_BASE_URL`, `NOSANA_API_KEY`, `NOSANA_MODEL`).
+- **Files Owned (Zero overlap with Person A)**:
+  - `backend/src/graph/neo4jClient.ts` — Seeds the dependency graph, runs GraphRAG queries to find single points of failure, and writes `[:CASCADED_TO]` edges + red `DOWN`/`DEGRADED` node statuses.
+  - `backend/src/agent/nosanaClient.ts` — Queries Nosana (OpenAI-compatible client + deterministic fallback) with the Neo4j topology to generate a `ChaosHypothesis` and later a `RemediationPatch` (circuit-breaker + timeout code diff).
+  - `frontend/src/` — React + Vite + Tailwind "Chaos Mission Control" UI: live interactive node graph (green $\rightarrow$ yellow $\rightarrow$ red cascade animation), live Daytona terminal feed, Nosana hypothesis card, and "Apply Fix & Re-Test in Daytona" button.
+
+### Timeline
+- **0:00 – 0:15 (Together)**: Step 1 — Initialize repo, commit `shared/types.ts`, and split onto parallel tracks.
+- **0:15 – 1:35 (Parallel)**:
+  - **Person A** builds Steps 2, 3, and 4 (Mock cluster, Daytona runner, Orchestrator SSE API).
+  - **Person B** builds Steps 5, 6, and 7 (Neo4j GraphRAG, Nosana client, React Mission Control UI).
+- **1:35 – 2:10 (Together)**: Step 8 — Merge, connect live credentials in `.env`, verify the full **Break $\rightarrow$ Cascade $\rightarrow$ Patch $\rightarrow$ Re-Verify** loop, and rehearse the 3-minute demo pitch.
+
+---
+
+## 6. Execution Plan Steps
+
+1. **[Shared - 10m]** Initialize the TypeScript monorepo (`package.json`, `.env.example`, `backend/`, `frontend/`) and define the shared TypeScript contract (`shared/types.ts`) for `TopologyGraph`, `ChaosHypothesis`, `SandboxTelemetry`, `RemediationPatch`, and `AgentStreamEvent`.
+2. **[Person A]** Build the miniature multi-service mock cluster and chaos harness (`backend/src/sandbox/payload/cluster.mjs`, `faultCtl.mjs`, `trafficGen.mjs`) as zero-dependency Node scripts simulating synchronous call chains, worker-pool contention, real TCP proxy fault injection (`latency`, `error_rate`, `kill`, `patch`), and p50/p95/p99 load telemetry.
+3. **[Person A]** Build the Daytona Sandbox Runner (`backend/src/sandbox/daytonaRunner.ts`) using `@daytonaio/sdk` (with warm sandbox reuse + automatic local subprocess fallback) to provision a Daytona workspace, upload and start the mock cluster, inject faults, capture cascading failure metrics, and hot-apply the circuit-breaker fix.
+4. **[Person A]** Build the ChaosAgent Orchestrator and Express SSE server (`backend/src/agent/orchestrator.ts`, `backend/src/index.ts`) with a single-flight state machine and SSE replay buffer (`GET /api/stream`, `POST /api/chaos/run`, `POST /api/chaos/remediate`, `POST /api/topology/reset`).
+5. **[Person B]** Build the Neo4j Topology & GraphRAG module (`backend/src/graph/neo4jClient.ts`) using `neo4j-driver` (with in-memory fallback) to seed the 6-service topology, run multi-hop Cypher vulnerability queries, and read/write blast-radius states (`HEALTHY`, `DEGRADED`, `DOWN`) and `[:CASCADED_TO]` edges.
+6. **[Person B]** Build the Nosana Reasoning Engine (`backend/src/agent/nosanaClient.ts`) using the OpenAI-compatible SDK pointed at Nosana (with a 7s hard timeout + deterministic GraphRAG fallback) to generate failure hypotheses from the Neo4j graph and produce a TypeScript timeout + circuit-breaker patch from post-chaos telemetry.
+7. **[Person B]** Build the React + TypeScript "Chaos Mission Control" Frontend (`frontend/src/`) with an interactive dependency graph (green/yellow/red cascading failure animation), live Daytona terminal stream, before/after blast-radius telemetry comparison cards, Cypher inspector, and one-click "Apply Fix & Re-Verify in Daytona".
+8. **[Shared - Integration]** Connect Person A and Person B modules against the shared interfaces, verify the end-to-end chaos and self-healing verification loop, and document the demo script and Neo4j Browser Cypher queries in `README.md`.
+
+---
+
+## 7. Locked Architectural Decisions (Hackathon Defaults)
+
+1. **Zero-Install `.mjs` Sandbox Payload**: All scripts uploaded into the Daytona sandbox (`cluster.mjs`, `faultCtl.mjs`, `trafficGen.mjs`) use built-in Node `http`/`net` modules with zero external dependencies so they boot in `<200ms` without running `npm install` or `npx tsx` inside Daytona.
+2. **Pre-Warmed Daytona Sandbox**: `daytonaRunner.ts` reuses a warm Daytona sandbox across runs (creating one on startup or first run) so live stage runs complete in ~5–8 seconds instead of waiting 25s for cold container provisioning.
+3. **Real Socket-Level Chaos + OS Signals**: Fault injection executes inside Daytona using real TCP socket delay/drop + OS signal support (`SIGSTOP`/`SIGKILL`) and logs the exact fault CLI commands to the live terminal stream.
+4. **Deterministic Hot-Patching**: Nosana outputs both a human-readable TypeScript `codeDiff` for the UI modal and structured `policyConfig` (`timeoutMs: 400`, `circuitBreakerThreshold: 3`, `fallbackMode: 'cached-token'`) written to the Daytona sandbox so applying the fix never fails due to brittle unified-diff line numbers.
+5. **Load-Bearing Neo4j GraphRAG**: Every hypothesis starts from a real multi-hop Cypher query finding transitive upstream dependencies lacking timeouts/circuit breakers, and the UI displays the exact Cypher query executed.
+6. **7-Second Nosana Timeout + Instant Fallback**: Nosana LLM requests enforce a hard `7000ms` timeout and strict JSON validation, seamlessly falling back to a pre-validated GraphRAG response if hackathon Wi-Fi or decentralized GPU cold-start spikes.
+7. **Before vs. After Verification Telemetry**: `SandboxTelemetry` records both `chaosMetrics` (5/6 nodes red, checkout failing) and `postPatchMetrics` (1 degraded datastore node, 0% checkout error rate) for a clear visual comparison.
+8. **Single-Flight Orchestrator + SSE History Replay**: `orchestrator.ts` prevents duplicate concurrent runs and replays the current run's event log whenever a browser tab connects or refreshes.

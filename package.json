@@ -1,0 +1,22 @@
+{
+  "name": "entropy",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "shared",
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "npm run dev:backend & npm run dev:frontend & wait",
+    "dev:backend": "npm run dev --workspace=@entropy/backend",
+    "dev:frontend": "npm run dev --workspace=@entropy/frontend",
+    "build": "npm run build --workspaces --if-present",
+    "demo": "npm run dev:backend & npm run dev:frontend & wait",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@entropy/shared",
+  "version": "0.1.0",
+  "private": true,
+  "exports": {
+    ".": "./types.ts"
+  },
+  "types": "./types.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}
