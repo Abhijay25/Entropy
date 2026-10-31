@@ -58,6 +58,8 @@ export interface OrchestratorDeps {
   graphSourceLabel?: string;
   /** Environment-level labels recorded on every run (e.g. a development graph store). */
   runWarnings?: string[];
+  /** Live acceptance mode: a development (working-tree) payload is refused, not merely labeled. */
+  liveMode?: boolean;
   createId?: () => string;
   recoveryDir?: string;
   limits?: Partial<typeof WORKFLOW_LIMITS>;
@@ -597,11 +599,14 @@ export class Orchestrator implements OrchestratorContract {
 
   private loadPayload(): LoadedPayload {
     if (!this.deps.payloadSelector) throw new OrchestratorError('PAYLOAD_NOT_CONFIGURED', 503, 'ENTROPY_SOURCE_SHA is not set; prepare a payload and configure it.');
+    let payload: LoadedPayload;
     try {
-      return loadPreparedPayload(this.deps.payloadSelector);
+      payload = loadPreparedPayload(this.deps.payloadSelector);
     } catch (error) {
       throw new OrchestratorError('PAYLOAD_NOT_PREPARED', 503, message(error));
     }
+    if (this.deps.liveMode && payload.manifest.development) throw new OrchestratorError('DEVELOPMENT_PAYLOAD_IN_LIVE_MODE', 409, 'Live mode requires a payload prepared from a committed revision (npm run prepare:payload -- <sha>), not a working-tree bundle.');
+    return payload;
   }
 
   private payloadWarnings(payload: LoadedPayload): string[] {

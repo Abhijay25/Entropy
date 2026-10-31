@@ -199,6 +199,17 @@ describe('Orchestrator', () => {
     expect(run.actualBlastRadiusIds).toEqual([]);
   });
 
+  it('refuses a development (working-tree) payload in live mode instead of labeling it a recorded source', async () => {
+    const repository = new Neo4jGraphRepository({ inMemory: true });
+    const developmentPayload = { ...payload, manifest: { ...payload.manifest, development: true } };
+    const manifest = await import('../sandbox/payloadManifest.js');
+    vi.spyOn(manifest, 'loadPreparedPayload').mockReturnValue(developmentPayload);
+    const live = new Orchestrator({ repository, nosana, provider: new FakeProvider(), budget: new SandboxBudget(2), events: new EventHub(repository), payloadSelector: SHA, recoveryDir: path.join(tempDir, 'recovery'), liveMode: true });
+    await expect(live.startRun('cdcdcdcd-0000-4000-8000-000000000001')).rejects.toMatchObject({ code: 'DEVELOPMENT_PAYLOAD_IN_LIVE_MODE', httpStatus: 409 });
+    expect(await repository.listRuns(20)).toEqual([]);
+    vi.restoreAllMocks();
+  });
+
   it('admits exactly one workflow when different-key requests race through async admission', async () => {
     const repository = new Neo4jGraphRepository({ inMemory: true });
     const claim = repository.claimOperationKey.bind(repository);

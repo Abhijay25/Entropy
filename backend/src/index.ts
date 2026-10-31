@@ -51,7 +51,7 @@ const diagnostics = new DiagnosticAgent({ repository, nosana: nosanaClient, prov
 const usingNeo4j = Boolean(config.neo4j.uri && config.neo4j.password);
 const graphSourceLabel = usingNeo4j ? 'Neo4j' : 'the in-memory DEVELOPMENT graph store (not Neo4j)';
 const runWarnings = usingNeo4j ? [] : ['DEVELOPMENT graph store: results are held in memory, not Neo4j, and are lost on restart. Excluded from live acceptance.'];
-const orchestrator = new Orchestrator({ repository, nosana: nosanaClient, provider, budget, events, payloadSelector, diagnostics, graphSourceLabel, runWarnings });
+const orchestrator = new Orchestrator({ repository, nosana: nosanaClient, provider, budget, events, payloadSelector, diagnostics, graphSourceLabel, runWarnings, liveMode: !development });
 
 class ApiError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
