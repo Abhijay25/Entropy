@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DiagnosticSessionSchema,
   PRIMARY_CHANNEL_BY_SERVICE,
+  REQUIRED_EVIDENCE_KINDS,
   SERVICE_REGISTRY,
   ValidatedEvidenceInputSchema,
   classifyReproduction,
@@ -14,6 +15,7 @@ import {
   type ServiceMetric,
   type TrialTelemetry
 } from '../../shared/types.js';
+import { withRecomputedMetrics } from '../../shared/fixtures/realTrials.js';
 import { NosanaClient } from './agent/nosanaClient.js';
 import { Neo4jGraphRepository } from './graph/neo4jClient.js';
 
@@ -86,10 +88,16 @@ function buildChaosSpans(): RequestSpan[] {
   return [...checkoutSpans, ...sessionSpans, ...redisCanarySpans, ...postgresCanarySpans];
 }
 
+/** The same call shapes as the chaos trace set, but fast, successful, and undelayed. */
+function buildHealthySpans(): RequestSpan[] {
+  return buildChaosSpans().map(({ errorClass: _errorClass, ...span }) => ({ ...span, durationMs: 10, statusCode: 200, faultApplied: false }));
+}
+
 function buildTrial(runId: string, id: string, kind: TrialTelemetry['kind'], degraded: ServiceId[] = []): TrialTelemetry {
   const isChaos = kind === 'chaos' || kind === 'reproduction-chaos';
   const checkoutErrors = isChaos ? 30 : 0;
-  return {
+  // Metrics are recomputed from the spans so the report is self-consistent (the comparator rejects contradictions).
+  return withRecomputedMetrics({
     id,
     runId,
     kind,
@@ -105,8 +113,8 @@ function buildTrial(runId: string, id: string, kind: TrialTelemetry['kind'], deg
     runtimeIdentity: 'node-v22.22.2',
     faultWitnessed: isChaos,
     metrics: buildMetrics(id, degraded),
-    spans: isChaos ? buildChaosSpans() : [],
-    artifacts: [],
+    spans: isChaos ? buildChaosSpans() : buildHealthySpans(),
+    artifacts: REQUIRED_EVIDENCE_KINDS.map((evidenceKind) => ({ id: `${id}:${evidenceKind}`, kind: evidenceKind, sizeBytes: 1, sha256: 'e'.repeat(64), truncated: false, available: true })),
     clientSummary: {
       scheduled: 130,
       started: 130,
@@ -121,7 +129,7 @@ function buildTrial(runId: string, id: string, kind: TrialTelemetry['kind'], deg
     },
     validity: 'valid',
     warnings: []
-  };
+  });
 }
 
 function jsonResponse(payload: unknown): Response {

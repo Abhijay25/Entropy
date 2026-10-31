@@ -140,6 +140,9 @@ export const ClientSummarySchema = z.object({ scheduled: count, started: count, 
   const expected = summary.checkoutCompleted === 0 ? null : summary.checkoutErrors / summary.checkoutCompleted;
   if (summary.checkoutErrorRate !== expected) context.addIssue({ code: 'custom', message: 'checkoutErrorRate must match counters.' });
   if (summary.businessSkipped !== undefined && summary.businessSkipped > summary.skipped) context.addIssue({ code: 'custom', message: 'businessSkipped cannot exceed skipped launches.' });
+  if (summary.checkoutCompleted > summary.checkoutStarted || summary.checkoutStarted > summary.started || summary.checkoutCompleted > summary.completed || summary.checkoutErrors > summary.checkoutCompleted || summary.checkoutErrors > summary.errors) context.addIssue({ code: 'custom', message: 'Checkout counters are inconsistent with root totals.' });
+  if ([summary.sessionCompleted, summary.redisCanaryCompleted, summary.postgresCanaryCompleted].some((value) => value !== undefined && value > summary.completed)) context.addIssue({ code: 'custom', message: 'Channel completions exceed total completions.' });
+  if ((summary.checkoutP95Ms === null) !== (summary.checkoutCompleted === 0)) context.addIssue({ code: 'custom', message: 'checkoutP95Ms must be null exactly when no checkout completed.' });
 });
 export type ClientSummary = z.infer<typeof ClientSummarySchema>;
 
@@ -212,19 +215,118 @@ export interface NosanaClientContract { hypothesize(context: RiskContext, contro
 export interface OrchestratorContract { startRun(operationKey: string): Promise<{ runId: EntityId }>; cancel(runId: EntityId): Promise<RunSnapshot>; reproduce(runId: EntityId, operationKey: string): Promise<{ reproductionId: EntityId; trialIds: EntityId[] }>; investigate(runId: EntityId, operationKey: string): Promise<{ diagnosticId: EntityId }>; }
 
 const rank: Record<NodeHealthStatus, number | undefined> = { HEALTHY: 0, DEGRADED: 1, DOWN: 2, UNKNOWN: undefined };
+
+/** Must equal the payload's thresholds (backend/src/sandbox/payload/lib/constants.ts); a test enforces it. */
+export const HEALTH_THRESHOLDS = { downMinSamples: 10, downErrorFraction: 0.8, degradedErrorFraction: 0.05, degradedP95Ms: 500, saturatedIntervalMs: 500, smallSample: 20 } as const;
+export const REQUIRED_EVIDENCE_KINDS = ['metrics', 'spans', 'fault_witness', 'runtime'] as const;
+
+/** Health recomputed from counters with the payload's classifier; a report's own status label is never trusted alone. */
+export function classifyMetricHealth(metric: Pick<ServiceMetric, 'requestsCompleted' | 'errorRate' | 'latencyP95Ms' | 'requestsQueued' | 'queueRejected' | 'longestSaturatedIntervalMs'>): NodeHealthStatus {
+  if (metric.requestsCompleted === 0 || metric.errorRate === null) return 'UNKNOWN';
+  if (metric.requestsCompleted >= HEALTH_THRESHOLDS.downMinSamples && metric.errorRate >= HEALTH_THRESHOLDS.downErrorFraction) return 'DOWN';
+  if (metric.errorRate >= HEALTH_THRESHOLDS.degradedErrorFraction) return 'DEGRADED';
+  if (metric.latencyP95Ms !== null && metric.latencyP95Ms > HEALTH_THRESHOLDS.degradedP95Ms) return 'DEGRADED';
+  if ((metric.requestsQueued ?? 0) > 0 || (metric.queueRejected ?? 0) > 0 || (metric.longestSaturatedIntervalMs ?? 0) >= HEALTH_THRESHOLDS.saturatedIntervalMs) return 'DEGRADED';
+  return 'HEALTHY';
+}
+
+const nearestRank = (values: readonly number[], p: number): number | null => { if (!values.length) return null; const sorted = [...values].sort((left, right) => left - right); return sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)] ?? null; };
+const sameMs = (left: number | null, right: number | null) => left === right || (left !== null && right !== null && Math.abs(left - right) < 1e-6);
+const isErrorStatus = (statusCode: number | undefined) => statusCode === undefined || statusCode < 200 || statusCode >= 300;
 const primaryMetric = (trial: TrialTelemetry, serviceId: ServiceId) => trial.metrics.find((metric) => metric.serviceId === serviceId && metric.channel === PRIMARY_CHANNEL_BY_SERVICE[serviceId]);
-const requiredEvidenceIsComplete = (trial: TrialTelemetry) => trial.spans.length < LIMITS.maxSpans && !trial.artifacts.some((artifact) => artifact.truncated && ['metrics', 'spans', 'fault_witness', 'runtime'].includes(artifact.kind));
-const delayedBusinessWitnesses = (trial: TrialTelemetry) => trial.spans.filter((span) => span.channel === 'business' && span.serviceId === 'redis-cache' && span.faultApplied);
-const witnessedCheckoutTraces = (trial: TrialTelemetry) => delayedBusinessWitnesses(trial).filter((span) => trial.spans.some((candidate) => candidate.traceId === span.traceId && candidate.channel === 'business' && (candidate.serviceId === 'order-service' || candidate.serviceId === 'payment-service')));
-const traceExercisesConfiguredEdge = (spans: RequestSpan[], source: ServiceId, target: ServiceId) => spans.some((span) => span.kind === 'client' && span.serviceId === source && span.downstreamId === target);
+
+/**
+ * Fail-closed metric integrity: identity, uniqueness, presence of every primary metric, counter and
+ * percentile consistency, recomputed health, unfinished handlers, and agreement with retained server spans.
+ */
+export function metricIntegrityReasons(trial: TrialTelemetry): string[] {
+  const reasons: string[] = [];
+  const keys = new Set<string>();
+  const ids = new Set<string>();
+  for (const metric of trial.metrics) {
+    const key = `${metric.serviceId}:${metric.channel}`;
+    if (keys.has(key)) reasons.push(`Duplicate metric for ${key}.`);
+    if (ids.has(metric.id)) reasons.push(`Duplicate metric id ${metric.id}.`);
+    keys.add(key); ids.add(metric.id);
+    if (metric.id !== `${trial.id}:${key}`) reasons.push(`Metric ${metric.id} does not belong to trial ${trial.id}.`);
+    if (metric.sampleCount !== metric.requestsCompleted) reasons.push(`${key}: sampleCount ${metric.sampleCount} differs from ${metric.requestsCompleted} completions.`);
+    const percentiles = [metric.latencyP50Ms, metric.latencyP95Ms, metric.latencyP99Ms];
+    if (metric.requestsCompleted === 0 ? percentiles.some((value) => value !== null) : percentiles.some((value) => value === null) || metric.latencyP50Ms! > metric.latencyP95Ms! || metric.latencyP95Ms! > metric.latencyP99Ms!) reasons.push(`${key}: percentiles are inconsistent with the sample population.`);
+    if (metric.requestsStarted > metric.requestsCompleted) reasons.push(`${key}: ${metric.requestsStarted - metric.requestsCompleted} handlers were unfinished at collection; their latency is censored.`);
+    const expected = classifyMetricHealth(metric);
+    if (expected !== metric.status) reasons.push(`${key}: reported status ${metric.status} contradicts its counters (recomputed ${expected}).`);
+    const server = trial.spans.filter((span) => span.kind === 'server' && span.serviceId === metric.serviceId && span.channel === metric.channel);
+    if (server.length !== metric.requestsCompleted) { reasons.push(`${key}: ${metric.requestsCompleted} completions reported but ${server.length} server spans retained.`); continue; }
+    const durations = server.map((span) => span.durationMs);
+    const errors = server.filter((span) => isErrorStatus(span.statusCode)).length;
+    if (errors !== metric.errorsTotal || !sameMs(nearestRank(durations, 0.5), metric.latencyP50Ms) || !sameMs(nearestRank(durations, 0.95), metric.latencyP95Ms) || !sameMs(nearestRank(durations, 0.99), metric.latencyP99Ms)) reasons.push(`${key}: errors or percentiles disagree with retained server spans.`);
+  }
+  for (const node of SERVICE_REGISTRY) if (!primaryMetric(trial, node.id)) reasons.push(`Primary ${PRIMARY_CHANNEL_BY_SERVICE[node.id]} metric for ${node.id} is missing.`);
+  return reasons;
+}
+
+/** All four required evidence kinds must be present, available, and untruncated. */
+const requiredEvidenceReasons = (trial: TrialTelemetry): string[] => REQUIRED_EVIDENCE_KINDS.flatMap((kind) => { const artifact = trial.artifacts.find((candidate) => candidate.kind === kind); return !artifact ? [`Required ${kind} evidence is missing.`] : !artifact.available || artifact.truncated ? [`Required ${kind} evidence is unavailable or truncated.`] : []; });
+
+const configuredEdge = (graph: TopologyGraph, source: ServiceId, target: ServiceId) => graph.edges.some((edge) => edge.evidenceKind === 'configured' && edge.source === source && edge.target === target);
+
+/**
+ * Walks parent links from a delayed Redis server span to its root. Valid only when every hop is a
+ * server span called by a client span over a configured edge, in the same business trace, ending at
+ * a parentless Frontend server span. Returns the chain (witness first) or undefined.
+ */
+function causalChain(trial: TrialTelemetry, witness: RequestSpan, graph: TopologyGraph): RequestSpan[] | undefined {
+  if (witness.kind !== 'server' || witness.serviceId !== 'redis-cache' || witness.channel !== 'business' || !witness.faultApplied) return undefined;
+  const byId = new Map(trial.spans.map((span) => [span.id, span]));
+  const chain: RequestSpan[] = [witness];
+  let server = witness;
+  for (let hop = 0; hop < SERVICE_REGISTRY.length; hop += 1) {
+    if (!server.parentSpanId) return server.serviceId === 'frontend' ? chain : undefined;
+    const client = byId.get(server.parentSpanId);
+    if (!client || client.kind !== 'client' || client.downstreamId !== server.serviceId || client.traceId !== witness.traceId || client.channel !== 'business' || !configuredEdge(graph, client.serviceId, server.serviceId) || !client.parentSpanId) return undefined;
+    const caller = byId.get(client.parentSpanId);
+    if (!caller || caller.kind !== 'server' || caller.serviceId !== client.serviceId || caller.traceId !== witness.traceId || caller.channel !== 'business') return undefined;
+    chain.push(client, caller);
+    server = caller;
+  }
+  return undefined;
+}
+
+/** Every fully linked business chain from a delayed Redis span to a Frontend root (checkout or session). */
+const causalChains = (trial: TrialTelemetry, graph: TopologyGraph = DEFAULT_CONFIGURED_TOPOLOGY) => trial.spans.flatMap((span) => { const chain = causalChain(trial, span, graph); return chain ? [chain] : []; });
+/** Validity needs at least one real checkout chain (through Payment), not only session calls. */
+const checkoutChains = (trial: TrialTelemetry, graph: TopologyGraph = DEFAULT_CONFIGURED_TOPOLOGY) => causalChains(trial, graph).filter((chain) => chain.some((link) => link.serviceId === 'payment-service'));
 const countTraceIds = (spans: RequestSpan[]) => new Set(spans.map((span) => span.traceId)).size;
 const completedSessionCount = (trial: TrialTelemetry) => trial.clientSummary.sessionCompleted ?? countTraceIds(trial.spans.filter((span) => span.channel === 'business' && span.serviceId === 'frontend' && !trial.spans.some((candidate) => candidate.traceId === span.traceId && (candidate.serviceId === 'order-service' || candidate.serviceId === 'payment-service'))));
 const completedCanaryCount = (trial: TrialTelemetry, serviceId: 'redis-cache' | 'postgres-db') => serviceId === 'redis-cache' ? trial.clientSummary.redisCanaryCompleted ?? countTraceIds(trial.spans.filter((span) => span.channel === 'canary' && span.serviceId === serviceId)) : trial.clientSummary.postgresCanaryCompleted ?? countTraceIds(trial.spans.filter((span) => span.channel === 'canary' && span.serviceId === serviceId));
 const hasPathToRedis = (serviceId: ServiceId, graph: TopologyGraph) => { const visit = (node: ServiceId, seen: Set<ServiceId>): boolean => node === 'redis-cache' || graph.edges.some((edge) => edge.evidenceKind === 'configured' && edge.source === node && !seen.has(edge.target) && visit(edge.target, new Set([...seen, edge.target]))); return visit(serviceId, new Set([serviceId])); };
-const healthyQuality = (trial: TrialTelemetry): string[] => { const reasons: string[] = []; if (!['baseline', 'control', 'reproduction-control'].includes(trial.kind)) reasons.push('Healthy trial has an invalid kind.'); if (trial.status !== 'COMPLETED') reasons.push('Trial did not complete.'); if (trial.faultWitnessed) reasons.push('Healthy trial recorded a fault witness.'); if (trial.clientSummary.scheduled !== 130 || trial.clientSummary.started !== 130 || trial.clientSummary.completed !== 130 || trial.clientSummary.errors !== 0) reasons.push('Healthy trial did not complete 130 error-free requests.'); if (trial.validity !== 'valid') reasons.push('Trial report is not valid.'); if (!requiredEvidenceIsComplete(trial)) reasons.push('Required evidence is incomplete.'); for (const node of SERVICE_REGISTRY) { const metric = primaryMetric(trial, node.id); if (!metric || metric.status !== 'HEALTHY') reasons.push(`Primary metric for ${node.id} is not HEALTHY.`); } return reasons; };
-export function evaluateBaselineTrial(trial: TrialTelemetry): { validity: 'valid' | 'inconclusive'; reasons: string[] } { return (() => { const reasons = healthyQuality(trial); return { validity: reasons.length ? 'inconclusive' : 'valid', reasons }; })(); }
-export function evaluateChaosTrial(trial: TrialTelemetry): { validity: 'valid' | 'inconclusive'; reasons: string[] } { const reasons: string[] = []; const clientSummary = trial.clientSummary; if (!['chaos', 'reproduction-chaos'].includes(trial.kind)) reasons.push('Chaos trial has an invalid kind.'); if (trial.status !== 'COMPLETED') reasons.push('Trial did not complete.'); if (trial.validity !== 'valid') reasons.push('Chaos report is not valid.'); if (!trial.faultWitnessed) reasons.push('Chaos trial did not record a fault witness.'); if (clientSummary.checkoutStarted < 95 || clientSummary.checkoutCompleted < 95) reasons.push('Insufficient checkout samples.'); if (completedSessionCount(trial) < 9) reasons.push('Insufficient session samples.'); if (completedCanaryCount(trial, 'redis-cache') < 9) reasons.push('Insufficient Redis canary samples.'); if (completedCanaryCount(trial, 'postgres-db') < 9) reasons.push('Insufficient Postgres canary samples.'); if ((clientSummary.businessSkipped ?? clientSummary.skipped) > Math.floor(SCHEDULED_BUSINESS_LAUNCHES * 0.05)) reasons.push('Generator skipped more than 5% of user workload.'); if (!witnessedCheckoutTraces(trial).length) reasons.push('Missing delayed Redis checkout business fault witness.'); if (!requiredEvidenceIsComplete(trial)) reasons.push('Required evidence is incomplete.'); return { validity: reasons.length ? 'inconclusive' : 'valid', reasons }; }
-export function evaluateMatchedPairAndBlastRadius(control: TrialTelemetry, chaos: TrialTelemetry, graph: TopologyGraph = DEFAULT_CONFIGURED_TOPOLOGY): ComparisonResult { const reasons = [...healthyQuality(control), ...evaluateChaosTrial(chaos).reasons]; const matchingKinds = control.kind === 'control' && chaos.kind === 'chaos' || control.kind === 'reproduction-control' && chaos.kind === 'reproduction-chaos'; if (!matchingKinds) reasons.push('Matched trials have incompatible kinds.'); if (control.executionMode !== chaos.executionMode) reasons.push('Matched trials have different execution modes.'); if (control.runId !== chaos.runId || control.sourceSha !== chaos.sourceSha || control.payloadHash !== chaos.payloadHash || control.workloadHash !== chaos.workloadHash || control.runtimeIdentity !== chaos.runtimeIdentity) reasons.push('Matched trials have different immutable identities.'); if (reasons.length) return { comparisonValidity: 'inconclusive', comparisonReasons: reasons, actualBlastRadiusIds: [], observedCascadeEdges: [] }; const witnesses = delayedBusinessWitnesses(chaos); const affected = SERVICE_REGISTRY.map((node) => node.id).filter((serviceId) => { const controlMetric = primaryMetric(control, serviceId); const chaosMetric = primaryMetric(chaos, serviceId); if (!controlMetric || !chaosMetric || rank[controlMetric.status] === undefined || rank[chaosMetric.status] === undefined) return false; if (rank[chaosMetric.status]! <= rank[controlMetric.status]!) return false; if (!hasPathToRedis(serviceId, graph)) return false; return witnesses.some((witness) => chaos.spans.some((span) => span.traceId === witness.traceId && span.channel === 'business' && span.serviceId === serviceId)); }); const observedCascadeEdges = graph.edges.filter((edge) => edge.evidenceKind === 'configured' && affected.includes(edge.source) && affected.includes(edge.target)).flatMap((edge) => { const witness = witnesses.find((candidate) => { const trace = chaos.spans.filter((span) => span.traceId === candidate.traceId && span.channel === 'business'); return traceExercisesConfiguredEdge(trace, edge.source, edge.target); }); if (!witness) return []; const ids = chaos.spans.filter((span) => span.traceId === witness.traceId && (span.serviceId === edge.source || span.serviceId === edge.target || span.id === witness.id)).map((span) => span.id); return [{ id: `observed:${chaos.id}:${edge.target}:${edge.source}`, source: edge.target, target: edge.source, relationship: 'CASCADED_TO' as const, evidenceKind: 'observed' as const, circuitBreaker: false, supportingSpanIds: ids }]; }); return { comparisonValidity: 'valid', comparisonReasons: [], actualBlastRadiusIds: affected, observedCascadeEdges }; }
+const healthyQuality = (trial: TrialTelemetry): string[] => { const reasons: string[] = []; if (!['baseline', 'control', 'reproduction-control'].includes(trial.kind)) reasons.push('Healthy trial has an invalid kind.'); if (trial.status !== 'COMPLETED') reasons.push('Trial did not complete.'); if (trial.faultWitnessed) reasons.push('Healthy trial recorded a fault witness.'); if (trial.clientSummary.scheduled !== 130 || trial.clientSummary.started !== 130 || trial.clientSummary.completed !== 130 || trial.clientSummary.errors !== 0) reasons.push('Healthy trial did not complete 130 error-free requests.'); if (trial.validity !== 'valid') reasons.push('Trial report is not valid.'); reasons.push(...requiredEvidenceReasons(trial), ...metricIntegrityReasons(trial)); for (const node of SERVICE_REGISTRY) { const metric = primaryMetric(trial, node.id); if (metric && metric.status !== 'HEALTHY') reasons.push(`Primary metric for ${node.id} is not HEALTHY.`); } return reasons; };
+export function evaluateBaselineTrial(trial: TrialTelemetry): { validity: 'valid' | 'inconclusive'; reasons: string[] } { const reasons = healthyQuality(trial); return { validity: reasons.length ? 'inconclusive' : 'valid', reasons }; }
+export function evaluateChaosTrial(trial: TrialTelemetry, graph: TopologyGraph = DEFAULT_CONFIGURED_TOPOLOGY): { validity: 'valid' | 'inconclusive'; reasons: string[] } { const reasons: string[] = []; const clientSummary = trial.clientSummary; if (!['chaos', 'reproduction-chaos'].includes(trial.kind)) reasons.push('Chaos trial has an invalid kind.'); if (trial.status !== 'COMPLETED') reasons.push('Trial did not complete.'); if (trial.validity !== 'valid') reasons.push('Chaos report is not valid.'); if (!trial.faultWitnessed) reasons.push('Chaos trial did not record a fault witness.'); if (clientSummary.checkoutStarted < 95 || clientSummary.checkoutCompleted < 95) reasons.push('Insufficient checkout samples.'); if (completedSessionCount(trial) < 9) reasons.push('Insufficient session samples.'); if (completedCanaryCount(trial, 'redis-cache') < 9) reasons.push('Insufficient Redis canary samples.'); if (completedCanaryCount(trial, 'postgres-db') < 9) reasons.push('Insufficient Postgres canary samples.'); if ((clientSummary.businessSkipped ?? clientSummary.skipped) > Math.floor(SCHEDULED_BUSINESS_LAUNCHES * 0.05)) reasons.push('Generator skipped more than 5% of user workload.'); if (!checkoutChains(trial, graph).length) reasons.push('Missing delayed Redis checkout business fault witness with a complete causal chain.'); reasons.push(...requiredEvidenceReasons(trial), ...metricIntegrityReasons(trial)); for (const node of SERVICE_REGISTRY) { const metric = primaryMetric(trial, node.id); if (metric && metric.status === 'UNKNOWN') reasons.push(`Primary metric for ${node.id} has no samples; impact cannot be evaluated.`); } return { validity: reasons.length ? 'inconclusive' : 'valid', reasons }; }
+export function evaluateMatchedPairAndBlastRadius(control: TrialTelemetry, chaos: TrialTelemetry, graph: TopologyGraph = DEFAULT_CONFIGURED_TOPOLOGY): ComparisonResult {
+  const reasons = [...healthyQuality(control), ...evaluateChaosTrial(chaos, graph).reasons];
+  const matchingKinds = control.kind === 'control' && chaos.kind === 'chaos' || control.kind === 'reproduction-control' && chaos.kind === 'reproduction-chaos';
+  if (!matchingKinds) reasons.push('Matched trials have incompatible kinds.');
+  if (control.executionMode !== chaos.executionMode) reasons.push('Matched trials have different execution modes.');
+  if (control.runId !== chaos.runId || control.sourceSha !== chaos.sourceSha || control.payloadHash !== chaos.payloadHash || control.workloadHash !== chaos.workloadHash || control.runtimeIdentity !== chaos.runtimeIdentity) reasons.push('Matched trials have different immutable identities.');
+  if (reasons.length) return { comparisonValidity: 'inconclusive', comparisonReasons: reasons.slice(0, 32).map((reason) => reason.slice(0, 512)), actualBlastRadiusIds: [], observedCascadeEdges: [] };
+  const chains = causalChains(chaos, graph);
+  // Every primary metric is present and sampled here (integrity gates above), so no node is skipped as "unaffected".
+  const affected = SERVICE_REGISTRY.map((node) => node.id).filter((serviceId) => {
+    const before = rank[primaryMetric(control, serviceId)!.status]!;
+    const after = rank[primaryMetric(chaos, serviceId)!.status]!;
+    return after > before && hasPathToRedis(serviceId, graph) && chains.some((chain) => chain.some((span) => span.serviceId === serviceId));
+  });
+  const observedCascadeEdges = graph.edges.filter((edge) => edge.evidenceKind === 'configured' && affected.includes(edge.source) && affected.includes(edge.target)).flatMap((edge) => {
+    for (const chain of chains) {
+      const index = chain.findIndex((span) => span.kind === 'client' && span.serviceId === edge.source && span.downstreamId === edge.target);
+      const callee = index > 0 ? chain[index - 1] : undefined;
+      if (index > 0 && callee && callee.kind === 'server' && callee.serviceId === edge.target) return [{ id: `observed:${chaos.id}:${edge.target}:${edge.source}`, source: edge.target, target: edge.source, relationship: 'CASCADED_TO' as const, evidenceKind: 'observed' as const, circuitBreaker: false, supportingSpanIds: [...new Set([chain[index]!.id, callee.id, chain[0]!.id])] }];
+    }
+    return [];
+  });
+  return { comparisonValidity: 'valid', comparisonReasons: [], actualBlastRadiusIds: affected, observedCascadeEdges };
+}
 export function classifyReproduction(original: RunSnapshot, control: TrialTelemetry, chaos: TrialTelemetry): ReproductionSummary { const originalControl = original.trials.find((trial) => trial.kind === 'control'); const originalChaos = original.trials.find((trial) => trial.kind === 'chaos'); if (!originalControl || !originalChaos) return { controlTrialId: control.id, chaosTrialId: chaos.id, classification: 'inconclusive', reasons: ['Original run does not contain a matched control and chaos pair.'] }; if (original.comparisonValidity !== 'valid') return { controlTrialId: control.id, chaosTrialId: chaos.id, classification: 'inconclusive', reasons: original.comparisonReasons }; if (control.kind !== 'reproduction-control' || chaos.kind !== 'reproduction-chaos') return { controlTrialId: control.id, chaosTrialId: chaos.id, classification: 'inconclusive', reasons: ['Reproduction trials must use reproduction-control and reproduction-chaos kinds.'] }; if (control.id === originalControl.id || chaos.id === originalChaos.id) return { controlTrialId: control.id, chaosTrialId: chaos.id, classification: 'inconclusive', reasons: ['Reproduction trials must have new trial IDs.'] }; const originalIdentityMatches = originalControl.sourceSha === control.sourceSha && originalControl.payloadHash === control.payloadHash && originalControl.workloadHash === control.workloadHash && originalControl.runtimeIdentity === control.runtimeIdentity && originalChaos.sourceSha === chaos.sourceSha && originalChaos.payloadHash === chaos.payloadHash && originalChaos.workloadHash === chaos.workloadHash && originalChaos.runtimeIdentity === chaos.runtimeIdentity; if (!originalIdentityMatches) return { controlTrialId: control.id, chaosTrialId: chaos.id, classification: 'inconclusive', reasons: ['Reproduction pair identities do not match the original pair.'] }; if (control.executionMode !== originalControl.executionMode || chaos.executionMode !== originalChaos.executionMode) return { controlTrialId: control.id, chaosTrialId: chaos.id, classification: 'inconclusive', reasons: ['Reproduction pair execution modes do not match the original pair.'] }; const result = evaluateMatchedPairAndBlastRadius(control, chaos, original.graph); if (result.comparisonValidity !== 'valid') return { controlTrialId: control.id, chaosTrialId: chaos.id, classification: 'inconclusive', reasons: result.comparisonReasons }; const delta = (trial: TrialTelemetry) => trial.clientSummary.checkoutErrorRate ?? 0; const originalIncrease = delta(originalChaos) - delta(originalControl); const reproductionIncrease = delta(chaos) - delta(control); const same = original.actualBlastRadiusIds.length === result.actualBlastRadiusIds.length && original.actualBlastRadiusIds.every((id) => result.actualBlastRadiusIds.includes(id)); const classification: ReproductionClassification = same && originalIncrease >= .2 && reproductionIncrease >= .2 ? 'reproduced' : result.actualBlastRadiusIds.length && !same ? 'partial' : 'not_reproduced'; return { controlTrialId: control.id, chaosTrialId: chaos.id, classification, reasons: [`Checkout error-rate increase: ${reproductionIncrease.toFixed(3)}.`] }; }
 
 /** DEVELOPMENT FIXTURE ONLY - never represents provider-backed evidence. */

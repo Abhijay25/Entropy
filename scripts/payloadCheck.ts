@@ -1,7 +1,8 @@
 // npm run payload:check — local healthy/fault/load correctness of the bundled payload.
 // Development check only: it bundles the working tree, so results are never recorded evidence.
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { evaluateBaselineTrial, evaluateChaosTrial, evaluateMatchedPairAndBlastRadius, TrialTelemetrySchema, type TrialTelemetry } from '../shared/types.js';
@@ -33,7 +34,14 @@ async function runTrial(bundleDir: string, input: TrialInput): Promise<TrialTele
   const exitCode = await runNode([path.join(bundleDir, 'runTrial.cjs'), '--input', 'input.json', '--output-dir', 'out'], dir, 60_000);
   if (exitCode !== 0) throw new Error(`runTrial exited ${exitCode}; see ${path.join(dir, 'out', 'terminal.log')}`);
   const { schemaVersion: _schemaVersion, ...report } = JSON.parse(readFileSync(path.join(dir, 'out', 'trial.json'), 'utf8')) as Record<string, unknown>;
-  return TrialTelemetrySchema.parse(report);
+  // Raw payload reports carry no artifact refs (the backend attaches them); build them from the real out/ files.
+  const evidenceFiles = { metrics: 'trial.json', spans: 'spans.jsonl', fault_witness: 'fault-witness.json', runtime: 'runtime.json' } as const;
+  const artifacts = Object.entries(evidenceFiles).map(([kind, file]) => {
+    const filePath = path.join(dir, 'out', file);
+    const bytes = existsSync(filePath) ? readFileSync(filePath) : undefined;
+    return { id: `${input.trialId}:${kind}`, kind, sizeBytes: bytes?.length ?? 0, sha256: createHash('sha256').update(bytes ?? '').digest('hex'), truncated: false, available: Boolean(bytes?.length) };
+  });
+  return TrialTelemetrySchema.parse({ ...report, artifacts });
 }
 
 async function checkAuthFailsClosed(bundleDir: string): Promise<void> {
