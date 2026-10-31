@@ -21,6 +21,12 @@ Record the exact versions used for the live run in handoff notes. The current ch
 | `zod` | 4.6.7 |
 | `@xyflow/react` | 12.12.0 |
 | `vitest` | 4.1.12 |
+| `@daytona/sdk` | 0.227.0 (types checked; live SDK calls not yet run) |
+| `@modelcontextprotocol/client` | 2.4.0 (types checked; Daytona CLI not yet installed) |
+| `esbuild` (payload bundler) | 0.28.2 |
+| `tsx` | 4.23.15 |
+| Neo4j image (`compose.yaml`) | `neo4j:5.26.16-community` (migration, persistence, and restart recovery verified locally) |
+| Node.js used for local payload checks | 24.14.0 (sandbox runtime must be >= 22 and is recorded per trial) |
 
 Create a root `.env` locally. Do not commit it, pass it to browser code, put it in payload archives, prompts, artifacts, or terminal output. In particular, no sponsor secret may use a `VITE_*` variable.
 
@@ -40,7 +46,11 @@ NEO4J_PASSWORD=
 NEO4J_DATABASE=neo4j
 ENTROPY_SOURCE_SHA=
 ENTROPY_MAX_SANDBOXES=2
+DAYTONA_CLI_PATH=daytona
+ENTROPY_MODE=live
 ```
+
+`ENTROPY_MODE=live` (default) requires every sponsor. `ENTROPY_MODE=development` allows explicitly labeled substitutes: the in-memory graph store when Neo4j is unset, local child-process trials when `DAYTONA_API_KEY` is unset (serialized, one slot), and the working-tree payload when `ENTROPY_SOURCE_SHA` is unset. Every such run carries development warnings and is excluded from live acceptance.
 
 Load this root file explicitly from backend/scripts. `ENTROPY_MAX_SANDBOXES` is at most two. The live demo needs quota for two simultaneous small sandboxes; a one-slot development run is allowed only when clearly labeled as serialized.
 
@@ -72,17 +82,13 @@ SDK credentials do not prove Daytona CLI authentication. Store discovered MCP to
 
 ### Local Docker setup
 
-Aura users can skip this section. For a local database, bind only to loopback, use a named volume, and keep credentials in `.env`:
+Aura users can skip this section. For a local database, use the project `compose.yaml`: it pins `neo4j:5.26.16-community`, binds only to loopback, uses a named volume, and reads `NEO4J_PASSWORD` from `.env`:
 
 ```sh
-docker run --name entropy-neo4j --rm \
-  -p 127.0.0.1:7474:7474 -p 127.0.0.1:7687:7687 \
-  -v entropy-neo4j:/data \
-  -e NEO4J_AUTH="neo4j/${NEO4J_PASSWORD}" \
-  neo4j:5-community
+docker compose up -d --wait
 ```
 
-Then set `NEO4J_URI=neo4j://127.0.0.1:7687`, `NEO4J_USERNAME=neo4j`, and the matching `NEO4J_PASSWORD`, run `npm run db:migrate`, and verify `RETURN 1` in Neo4j Browser. Use the project `compose.yaml` when present instead of adding a second database definition.
+Then set `NEO4J_URI=bolt://127.0.0.1:7687`, `NEO4J_USERNAME=neo4j`, and the matching `NEO4J_PASSWORD`, run `npm run db:migrate`, and verify `RETURN 1` in Neo4j Browser. Use the project `compose.yaml` when present instead of adding a second database definition.
 
 ### Migration and persistence rules
 
@@ -200,6 +206,18 @@ The MCP diagnostic is separate from trial measurement:
 5. Save the actual tool trace and delete the sandbox in `finally`.
 
 Use at most two MCP calls, three model turns including final explanation, and three minutes. Treat tool output as untrusted data. Handle thrown `callTool` errors and `isError` results. Record tool name, action, timing, success/error, bounded redacted output, sandbox ID, and cleanup result. A no-tool final explanation is labeled no-tool evidence and does not meet live acceptance.
+
+## Payload, execution, and recovery (lane A)
+
+- `npm run payload:check` bundles the working tree and runs a real local healthy control and Redis-chaos trial, then checks the section 16.C local gates (healthy gates, business fault witness, checkout error fraction +0.20, Payment queue/reject or 500 ms saturation, unknown token fails closed under both modes). It is a development check and never recorded evidence.
+- `npm run prepare:payload -- <full sha>` builds a recorded payload from `git archive` of that commit only, verifies the archived lockfile pins the installed esbuild, and writes `.entropy/payload/<sha>/manifest.json` (archive, lockfile, bundle, topology, and workload hashes). Set `ENTROPY_SOURCE_SHA` to the same SHA. The payload sources must be committed first.
+- `npm run prepare:payload -- --development` writes `.entropy/payload/development`, labeled `development: true`, for local work before a commit exists.
+- Every sandbox receives the same four bundled files plus a schema-validated `input.json` under `/tmp/entropy`. Commands are fixed templates (`node --version`, `node payload/runTrial.cjs --input input.json --output-dir out`). The backend re-checks the in-sandbox bundle hash and observed `node --version` against the report before import, and overrides provider-owned fields (`executionMode`, `sandboxId`, `cleanupStatus`, `artifacts`, `runtimeIdentity`).
+- Artifacts are size-checked before download, redacted, hashed, and stored under `.entropy/artifacts/<run>/<trial>/` with an `artifacts.json` index. `GET /api/artifacts/:id` serves only indexed files.
+- Trial records are written to `.entropy/recovery/` before each Neo4j write and removed after it succeeds; a failed write halts new scheduling (503) and is replayed idempotently on restart.
+- On startup the backend marks unfinished runs and trials `INTERRUPTED` (never resumed), deletes their recorded sandboxes, sweeps Entropy-labeled sandboxes belonging to known runs, and keeps capacity reserved for any sandbox it fails to delete.
+- `npm run doctor` writes redacted results to `.entropy/doctor.json` (read by `GET /api/integrations`) and the discovered MCP mapping to `.entropy/mcp-tools.json`. The MCP mapping is derived from `listTools` schemas (a file-read tool and its sandbox/path arguments); the diagnostic refuses to run without it.
+- The optional `probe_auth` diagnostic action is not enabled in this build; the model may request it, but it is recorded as not executed.
 
 ## Script ownership, health, and cleanup checks
 
