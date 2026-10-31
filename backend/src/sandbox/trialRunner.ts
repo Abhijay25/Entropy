@@ -1,7 +1,7 @@
 import { TrialTelemetrySchema, type CleanupStatus, type Fault, type TrialKind, type TrialTelemetry } from '../../../shared/types.js';
 import { collectTrialArtifacts } from '../evidence/collect.js';
 import type { LoadedPayload } from './payloadManifest.js';
-import { ProviderTimeoutError, type SandboxLabels, type SandboxProvider } from './provider.js';
+import { ProviderTimeoutError, SANDBOX_OWNER, type SandboxLabels, type SandboxProvider } from './provider.js';
 
 export const LIMITS_SEC = { create: 60, trialCommand: 60, upload: 30, delete: 30 } as const;
 
@@ -112,7 +112,7 @@ export class TrialRunner {
   }
 
   private async createWithReconciliation(spec: TrialSpec): Promise<string> {
-    const labels: SandboxLabels = { project: 'entropy', runId: spec.runId, trialId: spec.trialId, purpose: 'trial', createdAt: new Date().toISOString() };
+    const labels: SandboxLabels = { project: 'entropy', owner: SANDBOX_OWNER, runId: spec.runId, trialId: spec.trialId, purpose: 'trial', createdAt: new Date().toISOString() };
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       this.hooks.countAllocation(spec);
       try {

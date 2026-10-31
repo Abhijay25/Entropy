@@ -1,5 +1,6 @@
 // Application boundary for sandbox execution. Commands are fixed trusted templates;
 // nothing model- or browser-supplied is ever interpolated into them.
+import os from 'node:os';
 
 export const REMOTE_WORKDIR = '/tmp/entropy';
 
@@ -18,8 +19,15 @@ export function commandLine(command: TrustedCommand): string {
 
 export type SandboxPurpose = 'smoke' | 'trial' | 'diagnostic';
 
+/**
+ * Identifies the backend that created a sandbox, so a restarted backend can delete its own
+ * leftovers even when the run record was lost (in-memory store) without touching a teammate's.
+ */
+export const SANDBOX_OWNER = `${os.userInfo().username}-${os.hostname()}`.replace(/[^A-Za-z0-9_.-]/g, '-').slice(0, 63);
+
 export interface SandboxLabels {
   project: 'entropy';
+  owner: string;
   runId: string;
   trialId: string;
   purpose: SandboxPurpose;

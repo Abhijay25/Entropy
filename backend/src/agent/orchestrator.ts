@@ -24,7 +24,7 @@ import {
   type ValidatedEvidenceInput
 } from '../../../shared/types.js';
 import { ENTROPY_DIR, loadPreparedPayload, type LoadedPayload } from '../sandbox/payloadManifest.js';
-import { BudgetExhaustedError, type SandboxBudget, type SandboxProvider } from '../sandbox/provider.js';
+import { BudgetExhaustedError, SANDBOX_OWNER, type SandboxBudget, type SandboxProvider } from '../sandbox/provider.js';
 import { emptyTrial, faultFor, TrialFailure, TrialRunner, type PreparedTrial, type TrialSpec } from '../sandbox/trialRunner.js';
 import type { EventHub } from './events.js';
 
@@ -241,12 +241,14 @@ export class Orchestrator implements OrchestratorContract {
       if (trial) await this.deps.repository.saveTrial({ ...trial, cleanupStatus: status });
       if (status !== 'DELETED') this.holdOrphan(resource.sandboxId);
     }
-    // Labeled sandboxes for runs this repository knows about but no record still owns.
+    // Nothing is active at startup, so every sandbox this backend created is a leftover, even if
+    // its run record was lost (in-memory store). Others' sandboxes are swept only for known runs.
     try {
       for (const handle of await this.deps.provider.listOwned({ project: 'entropy' })) {
         if (deleted.includes(handle.id) || failedCleanup.includes(handle.id)) continue;
         const runId = handle.labels.runId;
-        if (!runId || !(await this.deps.repository.getRun(runId))) continue;
+        const ownLeftover = handle.labels.owner === SANDBOX_OWNER;
+        if (!ownLeftover && (!runId || !(await this.deps.repository.getRun(runId)))) continue;
         const status = await this.destroySandbox(handle.id);
         (status === 'DELETED' ? deleted : failedCleanup).push(handle.id);
         if (status !== 'DELETED') this.holdOrphan(handle.id);

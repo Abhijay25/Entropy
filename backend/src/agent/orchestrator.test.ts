@@ -303,6 +303,18 @@ describe('Orchestrator', () => {
     expect(run.warnings.some((warning) => warning.includes('12 KiB'))).toBe(true);
   });
 
+  it('deletes this backend\'s leftover sandboxes on restart even when the run record was lost (in-memory store)', async () => {
+    const provider = Object.assign(new FakeProvider(), { hangExecute: true });
+    const first = setup({ provider });
+    await first.orchestrator.startRun('56565656-5656-4565-8565-565656565656');
+    await vi.waitFor(() => expect(provider.executeLog.length).toBe(1));
+    // Process loss with an in-memory store: the restarted backend has an empty repository.
+    const restarted = setup({ provider, repository: new Neo4jGraphRepository({ inMemory: true }) });
+    const result = await restarted.orchestrator.recover();
+    expect(result.deleted).toEqual(['sbx-1']);
+    expect(provider.live.size).toBe(0);
+  });
+
   it('marks unfinished runs interrupted on restart and deletes their sandboxes', async () => {
     const repository = new Neo4jGraphRepository({ inMemory: true });
     const first = setup({ repository, provider: Object.assign(new FakeProvider(), { hangExecute: true }) });

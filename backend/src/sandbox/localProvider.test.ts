@@ -18,7 +18,7 @@ describe('LocalProcessProvider', () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'entropy-local-'));
     roots.push(root);
     const provider = new LocalProcessProvider(root);
-    const handle = await provider.create({ project: 'entropy', runId: 'run-1', trialId: 'trial-1', purpose: 'trial', createdAt: new Date().toISOString() });
+    const handle = await provider.create({ project: 'entropy', owner: 'test-owner', runId: 'run-1', trialId: 'trial-1', purpose: 'trial', createdAt: new Date().toISOString() });
     const fakeTrial = `
       const { spawn } = require('node:child_process');
       const fs = require('node:fs');
@@ -42,7 +42,7 @@ describe('LocalProcessProvider', () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'entropy-local-'));
     roots.push(root);
     const crashed = new LocalProcessProvider(root);
-    const handle = await crashed.create({ project: 'entropy', runId: 'run-3', trialId: 'trial-3', purpose: 'trial', createdAt: new Date().toISOString() });
+    const handle = await crashed.create({ project: 'entropy', owner: 'test-owner', runId: 'run-3', trialId: 'trial-3', purpose: 'trial', createdAt: new Date().toISOString() });
     await crashed.upload(handle.id, [{ remotePath: 'payload/runTrial.cjs', bytes: Buffer.from("require('node:fs').writeFileSync('pid', String(process.pid)); setInterval(() => {}, 1000);") }]);
     void crashed.execute(handle.id, 'run-trial', 30).catch(() => undefined);
     const pid = await vi.waitFor(() => Number(readFileSync(path.join(root, handle.id, 'workdir', 'pid'), 'utf8')), { timeout: 5000 });
@@ -55,7 +55,7 @@ describe('LocalProcessProvider', () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'entropy-local-'));
     roots.push(root);
     const provider = new LocalProcessProvider(root);
-    const handle = await provider.create({ project: 'entropy', runId: 'run-2', trialId: 'trial-2', purpose: 'trial', createdAt: new Date().toISOString() });
+    const handle = await provider.create({ project: 'entropy', owner: 'test-owner', runId: 'run-2', trialId: 'trial-2', purpose: 'trial', createdAt: new Date().toISOString() });
     await expect(provider.upload(handle.id, [{ remotePath: '../escape.txt', bytes: Buffer.from('x') }])).rejects.toThrow('escapes');
     await expect(provider.destroy('../../etc')).rejects.toThrow('Unknown local sandbox id');
   });

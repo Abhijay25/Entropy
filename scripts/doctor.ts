@@ -9,7 +9,7 @@ import { Neo4jGraphRepository } from '../backend/src/graph/neo4jClient.js';
 import { writeIntegrations } from '../backend/src/integrations.js';
 import { DaytonaProvider } from '../backend/src/sandbox/daytonaRunner.js';
 import { DaytonaMcpClient, deriveMapping, saveMapping } from '../backend/src/sandbox/mcpClient.js';
-import { REMOTE_WORKDIR, type SandboxHandle } from '../backend/src/sandbox/provider.js';
+import { REMOTE_WORKDIR, SANDBOX_OWNER, type SandboxHandle } from '../backend/src/sandbox/provider.js';
 
 type Check = { available: boolean; checkedAt: string; message: string; model?: string };
 const now = () => new Date().toISOString();
@@ -31,7 +31,7 @@ async function checkDaytona(provider: DaytonaProvider, onReady: (sandboxId: stri
   let mcp: Check = { available: false, checkedAt: now(), message: 'Not reached: Daytona SDK smoke did not complete.' };
   try {
     // Two concurrent small sandboxes: proves the quota supports the parallel matched pair.
-    const results = await Promise.allSettled([1, 2].map((index) => provider.create({ project: 'entropy', runId: smokeRunId, trialId: `${smokeRunId}-${index}`, purpose: 'smoke', createdAt: now() }, 60)));
+    const results = await Promise.allSettled([1, 2].map((index) => provider.create({ project: 'entropy', owner: SANDBOX_OWNER, runId: smokeRunId, trialId: `${smokeRunId}-${index}`, purpose: 'smoke', createdAt: now() }, 60)));
     for (const result of results) if (result.status === 'fulfilled') created.push(result.value);
     const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (rejected) throw new Error(`Could not hold two simultaneous sandboxes: ${fail(rejected.reason)}`);

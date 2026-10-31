@@ -10,7 +10,7 @@ import {
 } from '../../../shared/types.js';
 import { loadMapping, DaytonaMcpClient, type McpCallResult, type McpToolMapping, type ToolBinding } from '../sandbox/mcpClient.js';
 import { loadPreparedPayload } from '../sandbox/payloadManifest.js';
-import { BudgetExhaustedError, REMOTE_WORKDIR, type SandboxBudget, type SandboxProvider } from '../sandbox/provider.js';
+import { BudgetExhaustedError, REMOTE_WORKDIR, SANDBOX_OWNER, type SandboxBudget, type SandboxProvider } from '../sandbox/provider.js';
 import type { EventHub } from './events.js';
 import { persistedComparison, selectEvidence, type DiagnosticLauncher, type NosanaPort, type Repository } from './orchestrator.js';
 
@@ -73,7 +73,7 @@ export class DiagnosticAgent implements DiagnosticLauncher {
         throw error;
       }
       await save({ status: 'PREPARING' });
-      const handle = await this.deps.provider.create({ project: 'entropy', runId: run.id, trialId: diagnosticId, purpose: 'diagnostic', createdAt: new Date().toISOString() }, 60);
+      const handle = await this.deps.provider.create({ project: 'entropy', owner: SANDBOX_OWNER, runId: run.id, trialId: diagnosticId, purpose: 'diagnostic', createdAt: new Date().toISOString() }, 60);
       sandboxId = handle.id;
       await save({ sandboxId, cleanupStatus: 'PENDING' });
       const sanitized = {
