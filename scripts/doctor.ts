@@ -41,7 +41,7 @@ async function checkDaytona(provider: DaytonaProvider, onReady: (sandboxId: stri
     await provider.upload(sandbox.id, [{ remotePath: SMOKE_FILE, bytes: Buffer.from(SMOKE_CONTENT) }], 30);
     const roundTrip = (await provider.download(sandbox.id, SMOKE_FILE, 30)).toString('utf8');
     if (roundTrip !== SMOKE_CONTENT) throw new Error('Uploaded and downloaded smoke file contents differ.');
-    details.daytona = { sdk: `@daytona/sdk@${packageVersion('@daytona/sdk')}`, node: version.output.trim(), snapshot: config.daytona.snapshot ?? 'default', region: sandbox.region ?? 'unknown', concurrentSandboxes: created.length };
+    details.daytona = { sdk: `@daytona/sdk@${packageVersion('@daytona/sdk')}`, apiUrl: provider.apiUrl, target: config.daytona.target ?? 'account default', node: version.output.trim(), snapshot: config.daytona.snapshot ?? 'default', region: sandbox.region ?? 'unknown', concurrentSandboxes: created.length };
     mcp = await onReady(sandbox.id);
     return { daytona: { available: true, checkedAt: now(), message: `SDK ok: 2 concurrent sandboxes, node ${version.output.trim()}, file round-trip ok, region ${sandbox.region ?? 'unknown'}.` }, mcp };
   } catch (error) {

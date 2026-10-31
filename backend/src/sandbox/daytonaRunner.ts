@@ -4,6 +4,9 @@ import { Daytona, DaytonaNotFoundError, DaytonaTimeoutError, type Sandbox } from
 import { config } from '../config.js';
 import { commandLine, ProviderTimeoutError, REMOTE_WORKDIR, type ExecuteResult, type SandboxHandle, type SandboxLabels, type SandboxProvider, type TrustedCommand } from './provider.js';
 
+/** Documented default endpoint; the region is selected separately with DAYTONA_TARGET. */
+export const DEFAULT_DAYTONA_API_URL = 'https://app.daytona.io/api';
+
 export interface DaytonaProviderOptions {
   apiKey: string;
   apiUrl?: string;
@@ -23,11 +26,14 @@ function remote(remotePath: string): string {
 export class DaytonaProvider implements SandboxProvider {
   readonly executionMode = 'daytona' as const;
   readonly maxConcurrent: number;
+  readonly apiUrl: string;
   private readonly client: Daytona;
   private readonly sandboxes = new Map<string, Sandbox>();
 
   constructor(private readonly options: DaytonaProviderOptions, maxConcurrent = config.entropy.maxSandboxes) {
-    this.client = new Daytona({ apiKey: options.apiKey, ...(options.apiUrl ? { apiUrl: options.apiUrl } : {}), ...(options.target ? { target: options.target } : {}) });
+    // Always explicit: the SDK refuses an endpoint it cannot attribute when .env defines DAYTONA_API_URL.
+    this.apiUrl = options.apiUrl ?? DEFAULT_DAYTONA_API_URL;
+    this.client = new Daytona({ apiKey: options.apiKey, apiUrl: this.apiUrl, ...(options.target ? { target: options.target } : {}) });
     this.maxConcurrent = maxConcurrent;
   }
 
@@ -95,7 +101,8 @@ export class DaytonaProvider implements SandboxProvider {
   async destroy(sandboxId: string, timeoutSec: number): Promise<void> {
     try {
       const sandbox = await this.sandbox(sandboxId);
-      await this.client.delete(sandbox, timeoutSec);
+      // wait=true: report DELETED (and free capacity) only once the sandbox is actually destroyed.
+      await this.client.delete(sandbox, timeoutSec, true);
     } catch (error) {
       if (error instanceof DaytonaNotFoundError) return;
       if (isTimeout(error)) throw new ProviderTimeoutError('sandbox delete');
