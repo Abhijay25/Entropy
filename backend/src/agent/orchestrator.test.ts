@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { CATALOGUE_FALLBACK_HYPOTHESIS, SERVICE_REGISTRY, type EvidenceAnalysis, type RequestSpan, type ServiceId, type ServiceMetric, type TrialTelemetry } from '../../../shared/types.js';
+import { CATALOGUE_FALLBACK_HYPOTHESIS, DiagnosticPromptContextSchema, SERVICE_REGISTRY, type EvidenceAnalysis, type RequestSpan, type ServiceId, type ServiceMetric, type TrialTelemetry } from '../../../shared/types.js';
 import { Neo4jGraphRepository } from '../graph/neo4jClient.js';
 import type { LoadedPayload } from '../sandbox/payloadManifest.js';
 import { ProviderTimeoutError, SandboxBudget, type ExecuteResult, type SandboxHandle, type SandboxLabels, type SandboxProvider, type TrustedCommand } from '../sandbox/provider.js';
@@ -177,6 +177,15 @@ describe('Orchestrator', () => {
     expect(await orchestrator.startRun(key)).toEqual(first);
   });
 
+  it('rejects an operation key reused for a different action with a 409, not an internal error', async () => {
+    const { orchestrator } = setup();
+    const key = '12121212-1212-4121-8121-121212121212';
+    const { runId } = await orchestrator.startRun(key);
+    await orchestrator.idle();
+    await expect(orchestrator.reproduce(runId, key)).rejects.toMatchObject({ code: 'OPERATION_KEY_REUSED', httpStatus: 409 });
+    await expect(orchestrator.investigate(runId, key)).rejects.toMatchObject({ code: 'OPERATION_KEY_REUSED', httpStatus: 409 });
+  });
+
   it('stops after an invalid baseline without scheduling matched trials', async () => {
     const provider = new FakeProvider();
     provider.failExecuteFor.add('baseline');
@@ -328,6 +337,17 @@ describe('DiagnosticAgent', () => {
     expect(calls[0]!.args[1]).toBe('/tmp/entropy/.entropy-diagnostic/evidence.json');
     expect(provider.live.size).toBe(0);
     expect(budget.inUse).toBe(0);
+  });
+
+  it('sends Nosana a context that satisfies the strict DiagnosticPromptContext schema, including the tool trace', async () => {
+    const { run, repository, provider, budget, events } = await completedRun();
+    const contexts: unknown[] = [];
+    const actions = [{ action: 'read_evidence' as const }, { action: 'finish' as const, summary: 'Done.', metricIds: [], spanIds: [] }];
+    const agent = new DiagnosticAgent({ repository, nosana: { ...nosana, nextDiagnosticAction: async (context) => { contexts.push(context); return actions.shift()!; } }, provider, budget, events, payloadSelector: SHA, connectMcp: async () => ({ call: async (binding) => ({ toolName: binding.tool, ok: true, text: '{}' }), close: async () => undefined }), mapping: () => mapping });
+    await agent.launch(run, `${run.id}-diagnostic`, new AbortController().signal);
+    expect(contexts).toHaveLength(2);
+    for (const context of contexts) expect(DiagnosticPromptContextSchema.safeParse(context).error?.issues ?? []).toEqual([]);
+    expect((contexts[1] as { toolTrace?: unknown[] }).toolTrace).toHaveLength(1);
   });
 
   it('labels a session that finishes without any MCP call as no-tool evidence', async () => {

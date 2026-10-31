@@ -13,6 +13,8 @@ import {
   type EntityId,
   type EvidenceAnalysis,
   type GraphRepository,
+  type OperationAction,
+  type OperationClaim,
   type OrchestratorContract,
   type RiskContext,
   type RunSnapshot,
@@ -151,11 +153,8 @@ export class Orchestrator implements OrchestratorContract {
     this.assertSchedulable();
     const payload = this.loadPayload();
     const runId = this.createId();
-    const claim = await this.deps.repository.claimOperationKey(operationKey, 'run', runId);
-    if (claim.targetId && claim.targetId !== runId) {
-      if (claim.action !== 'run') throw new OrchestratorError('OPERATION_KEY_REUSED', 409, 'This operation key was used for a different action.');
-      return { runId: claim.targetId };
-    }
+    const claim = await this.claim(operationKey, 'run', runId);
+    if (claim.targetId && claim.targetId !== runId) return { runId: claim.targetId };
     // Re-check after the await: another request may have started a workflow meanwhile.
     this.assertSchedulable();
     await this.deps.repository.createRun({ id: runId, sourceSha: payload.manifest.sourceSha, payloadHash: payload.manifest.payloadHash, topologyHash: payload.manifest.topologyHash });
@@ -181,8 +180,8 @@ export class Orchestrator implements OrchestratorContract {
     const trialIds = [`${runId}-repro-control`, `${runId}-repro-chaos`];
     if (this.active?.operationKey === operationKey && this.active.kind === 'reproduction') return { reproductionId, trialIds };
     const run = await this.requireRun(runId);
-    const claim = await this.deps.repository.claimOperationKey(operationKey, 'reproduce', reproductionId);
-    if (claim.targetId && claim.targetId !== reproductionId) throw new OrchestratorError('OPERATION_KEY_REUSED', 409, 'This operation key was used for a different action.');
+    const claim = await this.claim(operationKey, 'reproduce', reproductionId, trialIds);
+    if (claim.targetId && claim.targetId !== reproductionId) throw new OrchestratorError('OPERATION_KEY_REUSED', 409, 'This operation key was used for a different run.');
     if (run.trials.some((trial) => trial.kind === 'reproduction-control' || trial.kind === 'reproduction-chaos')) return { reproductionId, trialIds };
     this.assertSchedulable();
     if (!TERMINAL_RUN.includes(run.status)) throw new OrchestratorError('RUN_NOT_TERMINAL', 409, 'Reproduction requires the original run to be finished.');
@@ -197,8 +196,8 @@ export class Orchestrator implements OrchestratorContract {
     const diagnosticId = `${runId}-diagnostic`;
     if (this.active?.operationKey === operationKey && this.active.kind === 'diagnostic') return { diagnosticId };
     const run = await this.requireRun(runId);
-    const claim = await this.deps.repository.claimOperationKey(operationKey, 'investigate', diagnosticId);
-    if (claim.targetId && claim.targetId !== diagnosticId) throw new OrchestratorError('OPERATION_KEY_REUSED', 409, 'This operation key was used for a different action.');
+    const claim = await this.claim(operationKey, 'investigate', diagnosticId);
+    if (claim.targetId && claim.targetId !== diagnosticId) throw new OrchestratorError('OPERATION_KEY_REUSED', 409, 'This operation key was used for a different run.');
     if (await this.deps.repository.getDiagnostic(diagnosticId)) return { diagnosticId };
     this.assertSchedulable();
     if (!this.deps.diagnostics) throw new OrchestratorError('DIAGNOSTICS_UNAVAILABLE', 503, 'Daytona MCP diagnostics are not configured.');
@@ -544,6 +543,16 @@ export class Orchestrator implements OrchestratorContract {
 
   private holdOrphan(sandboxId: string): void {
     try { this.deps.budget.reserve(1, `orphan:${sandboxId}`); } catch { /* capacity already fully held */ }
+  }
+
+  /** The repository rejects a key already claimed for another action; that is a client error (409). */
+  private async claim(operationKey: string, action: OperationAction, targetId: string, trialIds?: string[]): Promise<OperationClaim> {
+    try {
+      return await this.deps.repository.claimOperationKey(operationKey, action, targetId, trialIds);
+    } catch (error) {
+      if (error instanceof Error && /already claimed for action/.test(error.message)) throw new OrchestratorError('OPERATION_KEY_REUSED', 409, 'This operation key was already used for a different action.');
+      throw error;
+    }
   }
 
   private assertSchedulable(): void {
